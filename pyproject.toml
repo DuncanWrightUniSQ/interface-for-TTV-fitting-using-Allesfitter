@@ -1,0 +1,18 @@
+[project]
+name = "ttv-fitter"
+version = "0.1.0"
+description = "Streamlit transit timing variation fitter and 3D multiplanet renderer."
+requires-python = ">=3.10"
+dependencies = [
+  "streamlit>=1.35",
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "plotly>=5.20",
+  "scipy>=1.11",
+  "emcee>=3.1",
+  "astropy>=6.0",
+]
+
+[tool.ruff]
+line-length = 100
+
