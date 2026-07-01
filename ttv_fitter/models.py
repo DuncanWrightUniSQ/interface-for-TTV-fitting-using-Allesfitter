@@ -15,6 +15,9 @@ M_JUP_KG = 1.89813e27
 R_SUN_M = 6.957e8
 DAY_S = 86400.0
 AU_OVER_RSUN = 215.032
+M_JUP_OVER_M_SUN = M_JUP_KG / M_SUN_KG
+R_SUN_AU = 1.0 / AU_OVER_RSUN
+AU_M = 1.495978707e11
 
 
 @dataclass
@@ -27,6 +30,7 @@ class StarParams:
 @dataclass
 class PlanetParams:
     name: str = "b"
+    mass_jupiter: float = 0.003
     period: float = 3.0
     t0: float = 0.0
     radius_ratio: float = 0.08
@@ -36,6 +40,7 @@ class PlanetParams:
     inclination_deg: float = 87.0
     ecc: float = 0.0
     omega_deg: float = 90.0
+    mean_anomaly_deg: float = 0.0
     rv_k: float = 5.0
     color: str = "#2563eb"
 
@@ -104,6 +109,68 @@ def trapezoid_transit_model(
         ramp = (full_half - dt[in_ingress]) / max(ingress, 1e-8)
         flux[in_ingress] -= depth * np.clip(ramp, 0, 1)
     return flux
+
+
+def _derive_a_over_rstar_from_duration(
+    period: float,
+    radius_ratio: float,
+    impact: float,
+    duration_hours: float,
+) -> float:
+    duration_days = max(float(duration_hours) / 24.0, 1e-8)
+    period = max(float(period), 1e-8)
+    radius_ratio = float(np.clip(radius_ratio, 1e-6, 1.0))
+    impact = float(np.clip(impact, 0.0, 1.0 + radius_ratio - 1e-6))
+    sine_term = np.sin(np.pi * min(duration_days / period, 0.95))
+    if not np.isfinite(sine_term) or sine_term <= 0:
+        return 8.0
+    chord_sq = max((1.0 + radius_ratio) ** 2 - impact**2, 1e-8)
+    a_sq = (chord_sq + (sine_term * impact) ** 2) / max(sine_term**2, 1e-8)
+    return float(max(np.sqrt(a_sq), 1.0 + radius_ratio + 1e-6))
+
+
+def limb_darkened_transit_model(
+    time: np.ndarray,
+    period: float,
+    t0: float,
+    radius_ratio: float,
+    impact: float,
+    duration_hours: float,
+    u1: float,
+    u2: float,
+    baseline_offset: float = 0.0,
+    a_over_rstar: float | None = None,
+) -> np.ndarray:
+    """Return a quadratic limb-darkened transit model for per-transit inspection."""
+    time = np.asarray(time, dtype=float)
+    try:
+        import batman
+
+        if a_over_rstar is None or not np.isfinite(float(a_over_rstar)) or float(a_over_rstar) <= 0:
+            a_over_rstar = _derive_a_over_rstar_from_duration(period, radius_ratio, impact, duration_hours)
+        a_over_rstar = float(a_over_rstar)
+        inclination = float(np.rad2deg(np.arccos(np.clip(float(impact) / a_over_rstar, 0.0, 1.0))))
+        params = batman.TransitParams()
+        params.t0 = float(t0)
+        params.per = max(float(period), 1e-8)
+        params.rp = float(np.clip(radius_ratio, 1e-6, 1.0))
+        params.a = a_over_rstar
+        params.inc = inclination
+        params.ecc = 0.0
+        params.w = 90.0
+        params.u = [float(np.clip(u1, -1.0, 1.0)), float(np.clip(u2, -1.0, 1.0))]
+        params.limb_dark = "quadratic"
+        model = batman.TransitModel(params, time)
+        return model.light_curve(params) + float(baseline_offset)
+    except Exception:
+        return trapezoid_transit_model(
+            time,
+            period,
+            t0,
+            radius_ratio,
+            duration_hours,
+            baseline=1.0 + float(baseline_offset),
+        )
 
 
 def multi_transit_model(time: np.ndarray, planets: pd.DataFrame, baseline: float = 1.0) -> np.ndarray:
@@ -202,4 +269,3 @@ def planet_from_row(row: pd.Series | dict[str, object]) -> PlanetParams:
         if key in row:
             data[key] = row[key]
     return PlanetParams(**data)
-
