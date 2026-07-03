@@ -51,9 +51,10 @@ def ensure_allesfitter_workflows_available() -> None:
 
 def import_allesfitter_pages():
     ensure_allesfitter_workflows_available()
-    from app import mast, plots  # type: ignore
+    from app import mast, photometry, plots  # type: ignore
     from app.pages import photometry_fit, photometry_import, rv_import  # type: ignore
 
+    patch_eleanor_flux_columns(photometry)
     patch_mast_light_curve_filter(mast, photometry_import)
     patch_photometry_import_sigma_control(photometry_import)
     patch_photometry_fit_exofop_resolution(mast, photometry_fit)
@@ -64,6 +65,23 @@ def import_allesfitter_pages():
     patch_photometry_fit_impact_factor_language(photometry_fit)
     patch_photometry_fit_sampler_controls(photometry_fit)
     return photometry_import, rv_import, photometry_fit
+
+
+def patch_eleanor_flux_columns(photometry_module) -> None:
+    """Teach the reused photometry loader about Eleanor-lite FITS flux names."""
+    if getattr(photometry_module, "_ttv_fitter_eleanor_flux_patch", False):
+        return
+    current = list(getattr(photometry_module, "FLUX_COLUMNS", []))
+    preferred = ["CORR_FLUX", "PCA_FLUX", "RAW_FLUX"]
+    if "SAP_FLUX" in current:
+        insert_at = current.index("SAP_FLUX") + 1
+    else:
+        insert_at = 0
+    for name in reversed(preferred):
+        if name not in current:
+            current.insert(insert_at, name)
+    photometry_module.FLUX_COLUMNS = current
+    photometry_module._ttv_fitter_eleanor_flux_patch = True
 
 
 def _extract_sector(value: object) -> int | None:
