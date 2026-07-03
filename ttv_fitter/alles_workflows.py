@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 from io import StringIO
+from io import BytesIO
+import gc
 import math
 import multiprocessing as mp
 from pathlib import Path
@@ -12,14 +14,15 @@ import re
 import signal
 import subprocess
 import sys
+import zipfile
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from .io import normalize_photometry, normalize_rv, normalize_timings, parse_allesfitter_params, read_table
-from .models import coerce_planet_table, derive_a_over_rstar, derive_inclination_deg
+from .io import normalize_photometry, read_table
+from .models import coerce_planet_table, derive_a_over_rstar, derive_inclination_deg, limb_darkened_transit_model
 
 
 ALLESFITTER_WORK = Path("/Users/u8009283/Documents/Allesfitter_work")
@@ -462,6 +465,21 @@ def _clear_photometry_preparation_state() -> None:
         "sector_frames_key",
         "sector_uncertainties",
         "sector_flattening",
+        "ttv_first_pass_flattened",
+        "ttv_first_pass_window",
+        "ttv_first_pass_method",
+        "ttv_first_pass_cval",
+        "ttv_exofop_planets",
+        "ttv_exofop_planet_message",
+        "ttv_exofop_planet_error",
+        "ttv_found_transits",
+        "ttv_transit_search_half_width",
+        "ttv_second_pass_window",
+        "ttv_second_pass_method",
+        "ttv_second_pass_cval",
+        "prepared_sector_photometry",
+        "prepared_sector_summary",
+        "prepared_sector_directory",
         "prepared_photometry",
         "prepared_photometry_summary",
     ]:
@@ -473,6 +491,8 @@ def _reset_photometry_preparation_workflow() -> None:
     for key in [
         "uncertainty_sector_select",
         "flattening_sector_select",
+        "ttv_first_pass_sector_select",
+        "ttv_transit_mask_sector_select",
         "photometry_quality_zero_only",
     ]:
         st.session_state.pop(key, None)
@@ -484,6 +504,74 @@ def _workflow_sets_complete(stage_values: dict, sector_frames: dict[str, pd.Data
 
 def _workflow_sets_started(stage_values: dict, sector_frames: dict[str, pd.DataFrame]) -> bool:
     return bool(sector_frames) and bool(set(stage_values) & set(sector_frames))
+
+
+def _first_pass_cache_dir(photometry_import_module) -> Path:
+    target_part = "target"
+    target_part_getter = getattr(photometry_import_module, "_target_filename_part", None)
+    if callable(target_part_getter):
+        try:
+            target_part = str(target_part_getter() or target_part)
+        except Exception:  # noqa: BLE001 - cache naming should not block detrending
+            target_part = "target"
+    return Path("data") / "prepared" / target_part / "first_pass"
+
+
+def _first_pass_cache_path(photometry_import_module, sector_key: str) -> Path:
+    clean_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sector_key)).strip("_") or "sector"
+    return _first_pass_cache_dir(photometry_import_module) / f"{clean_key}_first_pass.pkl"
+
+
+def _write_first_pass_cache(
+    photometry_import_module,
+    sector_key: str,
+    first_pass: pd.DataFrame,
+    *,
+    window_length: float,
+    cval: float,
+    method: str = "biweight",
+) -> dict[str, object]:
+    path = _first_pass_cache_path(photometry_import_module, sector_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    first_pass.to_pickle(path)
+    return {
+        "path": str(path),
+        "points": int(len(first_pass)),
+        "high_outliers": int(first_pass["is_outlier"].sum()) if "is_outlier" in first_pass else 0,
+        "window_length": float(window_length),
+        "method": str(method),
+        "cval": float(cval),
+        "sector": str(first_pass["sector"].iloc[0]) if not first_pass.empty and "sector" in first_pass else str(sector_key),
+        "source_file": str(first_pass["source_file"].iloc[0]) if not first_pass.empty and "source_file" in first_pass else "",
+    }
+
+
+def _read_first_pass_cache(first_pass_entry: object) -> pd.DataFrame:
+    if isinstance(first_pass_entry, pd.DataFrame):
+        return first_pass_entry
+    if isinstance(first_pass_entry, dict):
+        path = first_pass_entry.get("path")
+    else:
+        path = first_pass_entry
+    if not path:
+        return pd.DataFrame()
+    cache_path = Path(str(path))
+    if not cache_path.exists():
+        return pd.DataFrame()
+    return pd.read_pickle(cache_path)
+
+
+def _first_pass_cache_entries_complete(first_pass_entries: dict, sector_frames: dict[str, pd.DataFrame]) -> bool:
+    if not _workflow_sets_complete(first_pass_entries, sector_frames):
+        return False
+    for key in sector_frames:
+        entry = first_pass_entries.get(key)
+        if isinstance(entry, pd.DataFrame):
+            continue
+        path = entry.get("path") if isinstance(entry, dict) else entry
+        if not path or not Path(str(path)).exists():
+            return False
+    return True
 
 
 def _sector_frames_match_paths(paths: list[str]) -> bool:
@@ -747,10 +835,10 @@ def _exofop_ephemerides_from_matches(matches: pd.DataFrame | None) -> list[dict[
         duration_hours = _duration_hours_from_exofop_row(row)
         if not np.isfinite(t0) or not np.isfinite(period) or period <= 0 or not np.isfinite(duration_hours) or duration_hours <= 0:
             continue
-        planet_label = row.get("Planet Name", row.get("TOI", row.get("TOI Number", index + 1)))
+        planet_label = _clean_exofop_planet_label(row, len(ephemerides))
         ephemerides.append(
             {
-                "planet": str(planet_label),
+                "planet": planet_label,
                 "t0": float(t0),
                 "period": float(period),
                 "duration_hours": float(duration_hours),
@@ -773,6 +861,363 @@ def _target_name_for_exofop_lookup() -> str:
     return ""
 
 
+def _planet_color(index: int) -> str:
+    colors = ["#ef4444", "#2563eb", "#16a34a", "#f59e0b", "#9333ea", "#0891b2", "#db2777", "#65a30d"]
+    return colors[int(index) % len(colors)]
+
+
+def _planet_letter(index: int) -> str:
+    return chr(ord("b") + int(index))
+
+
+def _clean_exofop_planet_label(row: pd.Series | dict, index: int) -> str:
+    for column in ["Planet Name", "Planet", "Planet Letter", "pl_letter", "letter"]:
+        value = row.get(column, None)
+        if pd.notna(value):
+            text = str(value).strip()
+            if text and text.lower() not in {"nan", "none", "null"}:
+                return text[-1].lower() if len(text) == 1 else text
+    for column in ["TOI", "TOI Number"]:
+        value = row.get(column, None)
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none", "null"}:
+            continue
+        match = re.search(r"\.(\d+)$", text)
+        if match:
+            return _planet_letter(max(int(match.group(1)) - 1, 0))
+    return _planet_letter(index)
+
+
+def _exofop_planet_rows_from_matches(matches: pd.DataFrame | None) -> pd.DataFrame:
+    if not isinstance(matches, pd.DataFrame) or matches.empty:
+        return pd.DataFrame()
+    rows = []
+    for index, row in matches.iterrows():
+        t0 = _coerce_float(row.get("Epoch (BJD)", np.nan), np.nan)
+        period = _coerce_float(row.get("Period (days)", np.nan), np.nan)
+        duration_hours = _duration_hours_from_exofop_row(row)
+        if not np.isfinite(t0) or not np.isfinite(period) or period <= 0 or not np.isfinite(duration_hours) or duration_hours <= 0:
+            continue
+        stellar_radius = _coerce_float(row.get("Stellar Radius (R_Sun)", np.nan), np.nan)
+        planet_radius = _coerce_float(row.get("Planet Radius (R_Earth)", np.nan), np.nan)
+        radius_ratio = np.nan
+        if np.isfinite(planet_radius) and np.isfinite(stellar_radius) and stellar_radius > 0:
+            radius_ratio = planet_radius * 0.0091577 / stellar_radius
+        depth_ppm = _coerce_float(row.get("Depth (ppm)", np.nan), np.nan)
+        if not np.isfinite(radius_ratio) and np.isfinite(depth_ppm):
+            radius_ratio = math.sqrt(max(depth_ppm, 0.0) / 1_000_000.0)
+        if not np.isfinite(radius_ratio) or radius_ratio <= 0:
+            radius_ratio = 0.05
+        planet_label = _clean_exofop_planet_label(row, len(rows))
+        rows.append(
+            {
+                "planet": planet_label,
+                "t0": float(t0),
+                "period": float(period),
+                "duration_hours": float(duration_hours),
+                "radius_ratio": float(radius_ratio),
+                "impact": 0.5,
+                "limb_darkening_u1": 0.5,
+                "limb_darkening_u2": 0.1,
+                "mask_duration_multiplier": 2.0,
+                "color": _planet_color(len(rows)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _exofop_planet_rows_from_ephemerides(ephemerides: list[dict[str, float]]) -> pd.DataFrame:
+    rows = []
+    for index, eph in enumerate(ephemerides):
+        planet = eph.get("planet", "")
+        if pd.isna(planet) or not str(planet).strip() or str(planet).strip().lower() in {"nan", "none", "null"}:
+            planet = _planet_letter(index)
+        rows.append(
+            {
+                "planet": planet,
+                "t0": _coerce_float(eph.get("t0"), np.nan),
+                "period": _coerce_float(eph.get("period"), np.nan),
+                "duration_hours": _coerce_float(eph.get("duration_hours"), np.nan),
+                "radius_ratio": _coerce_float(eph.get("radius_ratio"), 0.05),
+                "impact": _coerce_float(eph.get("impact"), 0.5),
+                "limb_darkening_u1": _coerce_float(eph.get("limb_darkening_u1"), 0.5),
+                "limb_darkening_u2": _coerce_float(eph.get("limb_darkening_u2"), 0.1),
+                "mask_duration_multiplier": _coerce_float(eph.get("mask_duration_multiplier"), 2.0),
+                "color": eph.get("color", _planet_color(index)),
+            }
+        )
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return table
+    return table.loc[np.isfinite(pd.to_numeric(table["period"], errors="coerce")) & (pd.to_numeric(table["period"], errors="coerce") > 0)].reset_index(drop=True)
+
+
+def _ephemerides_from_planet_rows(planets: pd.DataFrame) -> list[dict[str, float]]:
+    rows = []
+    if not isinstance(planets, pd.DataFrame) or planets.empty:
+        return rows
+    for _, row in planets.iterrows():
+        record = row.to_dict()
+        if np.isfinite(_coerce_float(record.get("t0"), np.nan)) and np.isfinite(_coerce_float(record.get("period"), np.nan)):
+            rows.append(record)
+    return rows
+
+
+def _flatten_sector_with_explicit_mask(
+    photometry_import_module,
+    frame: pd.DataFrame,
+    uncertainty: float,
+    *,
+    window_length: float,
+    method: str = "biweight",
+    transit_mask: np.ndarray | None = None,
+    cval: float = 5.0,
+    sigma_clip: float = 5.0,
+) -> pd.DataFrame:
+    prepared = photometry_import_module.normalized_sector(frame)
+    method, _ = _available_wotan_method(method)
+    trend = _wotan_trend_with_method(photometry_import_module, frame, window_length, method, mask=transit_mask, cval=cval)
+    prepared["trend"] = trend
+    prepared["wotan_method"] = method
+    prepared["wotan_cval"] = float(cval)
+    prepared["wotan_transit_mask"] = transit_mask if transit_mask is not None else False
+    prepared["flux_before_flatten"] = prepared["flux"]
+    safe_trend = np.where(np.isfinite(trend) & (trend != 0), trend, np.nan)
+    prepared["flux"] = prepared["flux_before_flatten"] / safe_trend
+    prepared["flux_err"] = uncertainty / safe_trend
+    residual = prepared["flux_before_flatten"].to_numpy(dtype=float) - safe_trend
+    scatter = float(uncertainty) if np.isfinite(uncertainty) and uncertainty > 0 else float(np.nanmedian(np.abs(residual - np.nanmedian(residual))) * 1.4826)
+    prepared["is_outlier"] = residual > sigma_clip * scatter if np.isfinite(scatter) and scatter > 0 else False
+    return prepared
+
+
+def _combined_transit_model(time: np.ndarray, events: list[dict[str, object]], centers: np.ndarray) -> np.ndarray:
+    model = np.ones_like(np.asarray(time, dtype=float), dtype=float)
+    for idx, event in enumerate(events):
+        planet = event["planet"]
+        shape = limb_darkened_transit_model(
+            time,
+            max(float(planet["period"]), 1e-8),
+            float(centers[idx]),
+            max(float(planet.get("radius_ratio", 0.05)), 1e-6),
+            float(planet.get("impact", 0.5)),
+            max(float(planet.get("duration_hours", 2.0)), 1e-4),
+            float(planet.get("limb_darkening_u1", 0.5)),
+            float(planet.get("limb_darkening_u2", 0.1)),
+            baseline_offset=0.0,
+        )
+        model += shape - 1.0
+    return model
+
+
+def _predicted_events_for_sector(frame: pd.DataFrame, planets: pd.DataFrame, search_half_width_days: float) -> list[dict[str, object]]:
+    if frame.empty or planets.empty or "time" not in frame:
+        return []
+    time = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
+    finite = time[np.isfinite(time)]
+    if finite.size == 0:
+        return []
+    tmin, tmax = float(np.nanmin(finite)), float(np.nanmax(finite))
+    events: list[dict[str, object]] = []
+    for planet_index, row in planets.reset_index(drop=True).iterrows():
+        period = _coerce_float(row.get("period"), np.nan)
+        t0 = _coerce_float(row.get("t0"), np.nan)
+        duration_hours = _coerce_float(row.get("duration_hours"), np.nan)
+        if not np.isfinite(period) or period <= 0 or not np.isfinite(t0) or not np.isfinite(duration_hours):
+            continue
+        aligned_t0 = _align_time_to_frame(float(t0), finite)
+        first_epoch = int(np.floor((tmin - search_half_width_days - aligned_t0) / period)) - 1
+        last_epoch = int(np.ceil((tmax + search_half_width_days - aligned_t0) / period)) + 1
+        planet = row.to_dict()
+        planet["t0"] = aligned_t0
+        planet["planet_index"] = planet_index
+        planet["color"] = planet.get("color", _planet_color(planet_index))
+        for epoch in range(first_epoch, last_epoch + 1):
+            expected = aligned_t0 + epoch * period
+            duration_days = max(float(duration_hours) / 24.0, 1e-5)
+            if expected + search_half_width_days + duration_days < tmin or expected - search_half_width_days - duration_days > tmax:
+                continue
+            events.append({"planet": planet, "epoch": epoch, "expected_tmid": expected, "tmid": expected})
+    return sorted(events, key=lambda event: float(event["expected_tmid"]))
+
+
+def _refine_transits_in_sector(first_pass: pd.DataFrame, planets: pd.DataFrame, search_half_width_days: float, grid_step_days: float = 0.01) -> pd.DataFrame:
+    events = _predicted_events_for_sector(first_pass, planets, search_half_width_days)
+    if not events:
+        return pd.DataFrame()
+    time = pd.to_numeric(first_pass["time"], errors="coerce").to_numpy(dtype=float)
+    flux = pd.to_numeric(first_pass["flux"], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(time) & np.isfinite(flux)
+    time = time[valid]
+    flux = flux[valid]
+    if time.size == 0:
+        return pd.DataFrame()
+
+    centers = np.array([float(event["expected_tmid"]) for event in events], dtype=float)
+    offsets = np.arange(-float(search_half_width_days), float(search_half_width_days) + grid_step_days / 2.0, grid_step_days)
+    for _iteration in range(2):
+        for idx, event in enumerate(events):
+            planet = event["planet"]
+            duration_days = max(float(planet.get("duration_hours", 2.0)) / 24.0, 1e-4)
+            local_half = max(float(search_half_width_days) + 1.5 * duration_days, 2.0 * duration_days, 0.05)
+            local = np.abs(time - centers[idx]) <= local_half
+            if np.count_nonzero(local) < 5:
+                continue
+            best_center = centers[idx]
+            best_sse = np.inf
+            for offset in offsets:
+                trial_centers = centers.copy()
+                trial_centers[idx] = float(event["expected_tmid"]) + float(offset)
+                model = _combined_transit_model(time[local], events, trial_centers)
+                sse = float(np.nansum((flux[local] - model) ** 2))
+                if sse < best_sse:
+                    best_sse = sse
+                    best_center = trial_centers[idx]
+            centers[idx] = best_center
+
+    rows = []
+    for idx, event in enumerate(events):
+        planet = event["planet"]
+        duration_days = max(float(planet.get("duration_hours", 2.0)) / 24.0, 1e-5)
+        mask_multiplier = max(float(planet.get("mask_duration_multiplier", 2.0)), 0.1)
+        half_width = 0.5 * mask_multiplier * duration_days
+        points = int(np.count_nonzero(np.abs(time - centers[idx]) <= half_width))
+        rows.append(
+            {
+                "planet": planet.get("planet", ""),
+                "planet_index": int(planet.get("planet_index", 0)),
+                "epoch": int(event["epoch"]),
+                "expected_tmid": float(event["expected_tmid"]),
+                "tmid": float(centers[idx]),
+                "offset_days": float(centers[idx] - float(event["expected_tmid"])),
+                "duration_hours": float(planet.get("duration_hours", np.nan)),
+                "mask_duration_multiplier": mask_multiplier,
+                "mask_half_width_days": half_width,
+                "points": points,
+                "color": planet.get("color", _planet_color(int(planet.get("planet_index", 0)))),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _mask_from_found_transits(frame: pd.DataFrame, found: pd.DataFrame) -> np.ndarray:
+    if frame.empty or found is None or found.empty or "time" not in frame:
+        return np.zeros(len(frame), dtype=bool)
+    time = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
+    mask = np.zeros(time.size, dtype=bool)
+    for _, row in found.iterrows():
+        tmid = _coerce_float(row.get("tmid"), np.nan)
+        half_width = _coerce_float(row.get("mask_half_width_days"), np.nan)
+        if np.isfinite(tmid) and np.isfinite(half_width) and half_width > 0:
+            mask |= np.abs(time - tmid) <= half_width
+    return mask
+
+
+def _transit_search_preview_figure(frame: pd.DataFrame, found: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    display = _sample_photometry_for_plot(frame, max_points=18_000) if len(frame) > 18_000 else frame
+    fig.add_trace(
+        go.Scattergl(
+            x=display["time"],
+            y=display["flux"],
+            mode="markers",
+            marker=dict(size=3, color="#2563eb", opacity=0.32),
+            name="first-pass detrended flux",
+        )
+    )
+    if found is not None and not found.empty:
+        full_time = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
+        for planet, group in found.groupby("planet", dropna=False):
+            planet_mask = np.zeros(len(frame), dtype=bool)
+            color = str(group["color"].iloc[0]) if "color" in group else "#f59e0b"
+            for _, row in group.iterrows():
+                tmid = _coerce_float(row.get("tmid"), np.nan)
+                half_width = _coerce_float(row.get("mask_half_width_days"), np.nan)
+                if np.isfinite(tmid) and np.isfinite(half_width) and half_width > 0:
+                    planet_mask |= np.abs(full_time - tmid) <= half_width
+            masked = frame.loc[planet_mask]
+            if not masked.empty:
+                masked_display = _sample_photometry_for_plot(masked, max_points=4_000) if len(masked) > 4_000 else masked
+                fig.add_trace(
+                    go.Scattergl(
+                        x=masked_display["time"],
+                        y=masked_display["flux"],
+                        mode="markers",
+                        marker=dict(size=4, color=color, opacity=0.6),
+                        name=f"masked {planet}",
+                    )
+                )
+    fig.update_layout(
+        height=460,
+        margin=dict(l=20, r=20, t=40, b=45),
+        xaxis_title="Time - BTJD",
+        yaxis_title="First-pass flattened flux",
+        uirevision="ttv_transit_search_preview",
+    )
+    return fig
+
+
+def _simple_display_stride(point_count: int, max_display_points: int = 20_000) -> int:
+    if point_count <= max_display_points:
+        return 1
+    return max(_simple_plot_stride(point_count), int(math.ceil(point_count / max_display_points)))
+
+
+def _stride_note(point_count: int, displayed_points: int, stride: int) -> str:
+    return f"Only every {_ordinal_word(stride)} data point is plotted to save memory ({displayed_points:,} of {point_count:,} points shown)."
+
+
+def _first_pass_preview_figure(first_pass: pd.DataFrame) -> tuple[go.Figure, str]:
+    fig = go.Figure()
+    if first_pass is None or first_pass.empty:
+        return fig, ""
+    stride = _simple_display_stride(len(first_pass), max_display_points=20_000)
+    display = first_pass.iloc[::stride].copy() if stride > 1 else first_pass
+    flux_column = "flux_before_flatten" if "flux_before_flatten" in display.columns else "flux"
+    fig.add_trace(
+        go.Scatter(
+            x=display["time"],
+            y=display[flux_column],
+            mode="markers",
+            marker={"size": 3, "color": "#2563eb", "opacity": 0.32},
+            name="Flux",
+        )
+    )
+    if "trend" in display.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=display["time"],
+                y=display["trend"],
+                mode="lines",
+                line={"color": "#ef4444", "width": 3},
+                name="Wotan trend",
+            )
+        )
+    note = _stride_note(len(first_pass), len(display), stride) if stride > 1 else ""
+    if note:
+        fig.add_annotation(
+            text=note,
+            x=0.01,
+            y=1.06,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            align="left",
+            font={"size": 12, "color": "#64748b"},
+        )
+        fig.update_layout(meta={"ttv_sampled_plot_note": note})
+    fig.update_layout(
+        height=460,
+        margin=dict(l=20, r=20, t=35, b=45),
+        xaxis_title="Time - BTJD",
+        yaxis_title="Relative flux",
+        uirevision="ttv_first_pass_preview",
+    )
+    return fig, note
+
+
 def _wotan_trend_with_method(
     photometry_import_module,
     frame: pd.DataFrame,
@@ -781,6 +1226,7 @@ def _wotan_trend_with_method(
     *,
     mask: np.ndarray | None = None,
     break_tolerance: float | None = None,
+    cval: float = 5.0,
 ) -> np.ndarray:
     from wotan import flatten
 
@@ -798,6 +1244,7 @@ def _wotan_trend_with_method(
             method=method,
             mask=mask,
             return_trend=True,
+            cval=float(cval),
         )
     except ImportError as exc:
         if method == "huber" and "statsmodels" in str(exc).lower():
@@ -809,6 +1256,7 @@ def _wotan_trend_with_method(
                 method="biweight",
                 mask=mask,
                 return_trend=True,
+                cval=float(cval),
             )
         else:
             raise
@@ -825,14 +1273,16 @@ def _flatten_sector_with_method(
     mask_transits: bool = False,
     mask_ephemerides: list[dict[str, float]] | None = None,
     mask_width_durations: float = 1.5,
+    cval: float = 5.0,
     sigma_clip: float = 5.0,
 ) -> pd.DataFrame:
     prepared = photometry_import_module.normalized_sector(frame)
     method, _ = _available_wotan_method(method)
     transit_mask = _transit_mask_for_ephemerides(frame, mask_ephemerides or [], width_durations=mask_width_durations) if mask_transits else None
-    trend = _wotan_trend_with_method(photometry_import_module, frame, window_length, method, mask=transit_mask)
+    trend = _wotan_trend_with_method(photometry_import_module, frame, window_length, method, mask=transit_mask, cval=cval)
     prepared["trend"] = trend
     prepared["wotan_method"] = method
+    prepared["wotan_cval"] = float(cval)
     prepared["wotan_transit_mask"] = transit_mask if transit_mask is not None else False
     prepared["flux_before_flatten"] = prepared["flux"]
 
@@ -861,6 +1311,7 @@ def _flattening_status_table_with_method(sector_frames: dict[str, pd.DataFrame],
                 "points": len(frame),
                 "wotan_window_days": settings.get("window_length", np.nan),
                 "wotan_method": settings.get("method", "biweight") if key in sector_flattening else "",
+                "wotan_cval": settings.get("cval", np.nan),
                 "mask_transits": settings.get("mask_transits", np.nan),
                 "mask_planets": settings.get("mask_planets", np.nan),
                 "mask_width_durations": settings.get("mask_width_durations", np.nan),
@@ -878,26 +1329,55 @@ def _stitch_flattened_sectors_with_method(
     sector_flattening: dict[str, dict],
     *,
     sigma_clip: float = 5.0,
+    progress_callback=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     frames = []
     summary_rows = []
-    for key, frame in sector_frames.items():
+    sector_items = list(sector_frames.items())
+    total_sectors = len(sector_items)
+    processed = 0
+    for key, frame in sector_items:
         if key not in sector_uncertainties or key not in sector_flattening:
             continue
+        processed += 1
+        if callable(progress_callback):
+            progress_callback(processed, total_sectors, key, frame)
         settings = sector_flattening[key]
         window_length = float(settings["window_length"])
         method = str(settings.get("method", "biweight"))
-        prepared = _flatten_sector_with_method(
-            photometry_import_module,
-            frame,
-            sector_uncertainties[key],
-            window_length=window_length,
-            method=method,
-            mask_transits=bool(settings.get("mask_transits", False)),
-            mask_ephemerides=settings.get("mask_ephemerides", []),
-            mask_width_durations=float(settings.get("mask_width_durations", 1.5)),
-            sigma_clip=sigma_clip,
-        )
+        cval = float(settings.get("cval", 5.0))
+        found_records = settings.get("mask_found_transits", [])
+        cached_first_pass = settings.get("first_pass_cache_path") if settings.get("use_cached_first_pass") else None
+        if cached_first_pass:
+            prepared = _read_first_pass_cache(cached_first_pass)
+            if prepared.empty:
+                continue
+        elif found_records:
+            found = pd.DataFrame(found_records)
+            transit_mask = _mask_from_found_transits(frame, found)
+            prepared = _flatten_sector_with_explicit_mask(
+                photometry_import_module,
+                frame,
+                sector_uncertainties[key],
+                window_length=window_length,
+                method=method,
+                transit_mask=transit_mask,
+                cval=cval,
+                sigma_clip=sigma_clip,
+            )
+        else:
+            prepared = _flatten_sector_with_method(
+                photometry_import_module,
+                frame,
+                sector_uncertainties[key],
+                window_length=window_length,
+                method=method,
+                mask_transits=bool(settings.get("mask_transits", False)),
+                mask_ephemerides=settings.get("mask_ephemerides", []),
+                mask_width_durations=float(settings.get("mask_width_durations", 1.5)),
+                cval=cval,
+                sigma_clip=sigma_clip,
+            )
         frames.append(prepared)
         summary_rows.append(
             {
@@ -908,10 +1388,12 @@ def _stitch_flattened_sectors_with_method(
                 "adopted_uncertainty": sector_uncertainties[key],
                 "wotan_window_days": window_length,
                 "wotan_method": method,
+                "wotan_cval": cval,
                 "mask_transits": bool(settings.get("mask_transits", False)),
                 "mask_planets": int(settings.get("mask_planets", len(settings.get("mask_ephemerides", [])))),
                 "mask_width_durations": float(settings.get("mask_width_durations", 1.5)),
                 "masked_points": int(pd.Series(prepared.get("wotan_transit_mask", False)).sum()),
+                "found_transits": int(settings.get("found_transits", len(found_records))),
                 "flux_column": prepared["flux_column"].iloc[0] if "flux_column" in prepared else "",
                 "err_column": prepared["err_column"].iloc[0] if "err_column" in prepared else "",
             }
@@ -923,6 +1405,79 @@ def _stitch_flattened_sectors_with_method(
     stitched = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
     summary = pd.DataFrame(summary_rows)
     return stitched, summary
+
+
+def _prepared_sector_tables_with_method(
+    photometry_import_module,
+    sector_frames: dict[str, pd.DataFrame],
+    sector_uncertainties: dict[str, float],
+    sector_flattening: dict[str, dict],
+    *,
+    sigma_clip: float = 5.0,
+    progress_callback=None,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    sector_tables: dict[str, pd.DataFrame] = {}
+    summary_rows = []
+    sector_items = list(sector_frames.items())
+    total_sectors = len(sector_items)
+    processed = 0
+    for key, frame in sector_items:
+        if key not in sector_uncertainties or key not in sector_flattening:
+            continue
+        processed += 1
+        if callable(progress_callback):
+            progress_callback(processed, total_sectors, key, frame)
+        settings = sector_flattening[key]
+        window_length = float(settings["window_length"])
+        method = str(settings.get("method", "biweight"))
+        cval = float(settings.get("cval", 5.0))
+        found_records = settings.get("mask_found_transits", [])
+        cached_first_pass = settings.get("first_pass_cache_path") if settings.get("use_cached_first_pass") else None
+        if cached_first_pass:
+            prepared = _read_first_pass_cache(cached_first_pass)
+            if prepared.empty:
+                continue
+        elif found_records:
+            transit_mask = _mask_from_found_transits(frame, pd.DataFrame(found_records))
+            prepared = _flatten_sector_with_explicit_mask(
+                photometry_import_module,
+                frame,
+                sector_uncertainties[key],
+                window_length=window_length,
+                method=method,
+                transit_mask=transit_mask,
+                cval=cval,
+                sigma_clip=sigma_clip,
+            )
+        else:
+            prepared = _flatten_sector_with_method(
+                photometry_import_module,
+                frame,
+                sector_uncertainties[key],
+                window_length=window_length,
+                method=method,
+                mask_transits=bool(settings.get("mask_transits", False)),
+                mask_ephemerides=settings.get("mask_ephemerides", []),
+                mask_width_durations=float(settings.get("mask_width_durations", 1.5)),
+                cval=cval,
+                sigma_clip=sigma_clip,
+            )
+        sector_label = str(prepared["sector"].iloc[0]) if "sector" in prepared and not prepared.empty else str(key)
+        sector_tables[key] = prepared.sort_values("time").reset_index(drop=True)
+        summary_rows.append(
+            {
+                "sector_key": key,
+                "sector": sector_label,
+                "source_file": prepared["source_file"].iloc[0] if "source_file" in prepared else "",
+                "points": len(prepared),
+                "kept_points": int((~prepared["is_outlier"]).sum()) if "is_outlier" in prepared else len(prepared),
+                "high_outliers": int(prepared["is_outlier"].sum()) if "is_outlier" in prepared else 0,
+                "wotan_window_days": window_length,
+                "wotan_method": method,
+                "wotan_cval": cval,
+            }
+        )
+    return sector_tables, pd.DataFrame(summary_rows)
 
 
 def _retrieve_exofop_ephemerides_for_flattening(photometry_fit_module) -> tuple[list[dict[str, float]], str]:
@@ -970,138 +1525,339 @@ def _render_flattening_workflow_with_method(photometry_import_module, photometry
         return
 
     sector_flattening = st.session_state.setdefault("sector_flattening", {})
+    first_pass_by_sector = st.session_state.setdefault("ttv_first_pass_flattened", {})
+    found_by_sector = st.session_state.setdefault("ttv_found_transits", {})
     status = photometry_import_module.flattening_status_table(sector_frames, sector_flattening)
     if not status.empty:
         st.dataframe(photometry_import_module._style_status_table(status), use_container_width=True, hide_index=True)
 
-    sector_key = st.selectbox("Sector to flatten", list(sector_frames.keys()), key="flattening_sector_select")
-    method_default = str(sector_flattening.get(sector_key, {}).get("method", "biweight"))
-    control_cols = st.columns([0.7, 0.3])
-    with control_cols[0]:
-        window_length = st.slider(
-            "Wotan flattening window [days]",
+    first_pass_window_col, first_pass_cval_col = st.columns([2, 1])
+    with first_pass_window_col:
+        first_pass_window = st.slider(
+            "1st pass heavy detrend window [days]",
             min_value=0.1,
-            max_value=2.0,
-            value=float(sector_flattening.get(sector_key, {}).get("window_length", 0.8)),
-            step=0.05,
-            key=f"flatten_window_{sector_key}",
+            max_value=10.0,
+            value=float(st.session_state.get("ttv_first_pass_window", 1.2)),
+            step=0.1,
+            key="ttv_first_pass_window_input",
+            help="Use roughly 10x the longest expected transit duration. This first pass is only used to find and mask transits.",
         )
-    with control_cols[1]:
-        method = st.radio(
-            "Wotan method",
-            ["biweight", "huber"],
-            index=1 if method_default == "huber" else 0,
-            key=f"flatten_method_{sector_key}",
-            horizontal=True,
-            help="Biweight is the faster default. Huber is more robust for deep/high-cadence transits but can be slower.",
+    with first_pass_cval_col:
+        first_pass_cval = st.slider(
+            "Wotan robust cval",
+            min_value=1.0,
+            max_value=10.0,
+            value=float(st.session_state.get("ttv_first_pass_cval", 5.0)),
+            step=0.5,
+            key="ttv_first_pass_cval_input",
+            help="Robustness tuning for Wotan biweight/huber detrending. Lower values reject transit-like outliers more aggressively; Wotan's biweight default is 5.",
         )
-    effective_method, method_warning = _available_wotan_method(method)
-    if method_warning:
-        st.warning(method_warning)
-    elif effective_method == "huber":
-        st.caption("Huber robust smoothing can better resist deep transit dips in high-sample-rate data, at the cost of extra runtime.")
-
-    current_frame = sector_frames[sector_key]
-    normalized = photometry_import_module.normalized_sector(current_frame)
-    if st.button("Retrieve all ExoFOP planet parameters and mask transits", use_container_width=True, key="flatten_retrieve_exofop_masks"):
-        with st.spinner("Retrieving ExoFOP planet ephemerides for transit masking..."):
-            try:
-                ephemerides, message = _retrieve_exofop_ephemerides_for_flattening(photometry_fit_module)
-            except Exception as exc:  # noqa: BLE001 - user-facing resolver/network/table issue
-                st.session_state["flatten_exofop_mask_error"] = str(exc)
-                st.session_state.pop("flatten_exofop_ephemerides", None)
-            else:
-                if ephemerides:
-                    st.session_state["flatten_exofop_ephemerides"] = ephemerides
-                    st.session_state["flatten_exofop_mask_message"] = message
-                    st.session_state.pop("flatten_exofop_mask_error", None)
-                else:
-                    st.session_state["flatten_exofop_mask_error"] = message
-                    st.session_state.pop("flatten_exofop_ephemerides", None)
+    if st.button("1st pass heavy detrend (should be 10x longest transit duration)", use_container_width=True, key="ttv_first_pass_heavy_detrend"):
+        first_pass_by_sector = {}
+        with st.spinner("Running first-pass heavy detrend for every sector..."):
+            progress = st.progress(0.0)
+            status_text = st.empty()
+            sector_items = list(sector_frames.items())
+            total_sectors = len(sector_items)
+            for index, (key, frame) in enumerate(sector_items, start=1):
+                sector_label = frame["sector"].iloc[0] if not frame.empty and "sector" in frame else key
+                status_text.caption(f"Processing sector {index}/{total_sectors}: {sector_label}")
+                first_pass = _flatten_sector_with_explicit_mask(
+                    photometry_import_module,
+                    frame,
+                    sector_uncertainties[key],
+                    window_length=float(first_pass_window),
+                    method="biweight",
+                    transit_mask=None,
+                    cval=float(first_pass_cval),
+                    sigma_clip=sigma_clip,
+                )
+                first_pass_by_sector[key] = _write_first_pass_cache(
+                    photometry_import_module,
+                    key,
+                    first_pass,
+                    window_length=float(first_pass_window),
+                    method="biweight",
+                    cval=float(first_pass_cval),
+                )
+                del first_pass
+                gc.collect()
+                progress.progress(index / total_sectors)
+            status_text.caption(f"First-pass heavy detrend complete for {total_sectors} sector(s).")
+        st.session_state["ttv_first_pass_flattened"] = first_pass_by_sector
+        st.session_state["ttv_first_pass_window"] = float(first_pass_window)
+        st.session_state["ttv_first_pass_method"] = "biweight"
+        st.session_state["ttv_first_pass_cval"] = float(first_pass_cval)
+        st.session_state.pop("ttv_found_transits", None)
+        st.session_state.pop("sector_flattening", None)
+        st.session_state.pop("prepared_photometry", None)
+        st.session_state.pop("prepared_photometry_summary", None)
+        st.success(f"First-pass heavy detrend complete for {len(first_pass_by_sector)} sector(s).")
         st.rerun()
 
-    if st.session_state.get("flatten_exofop_mask_error"):
-        st.warning(st.session_state["flatten_exofop_mask_error"])
-    ephemerides = st.session_state.get("flatten_exofop_ephemerides", [])
-    mask_transits = bool(ephemerides)
-    mask_width_durations = 1.5
-    if mask_transits:
-        st.caption(
-            st.session_state.get(
-                "flatten_exofop_mask_message",
-                f"Using {len(ephemerides)} ExoFOP planet ephemeris row(s) for Wotan transit masking.",
-            )
-            + " Mask width is fixed at 1.5x transit duration."
-        )
+    first_pass_complete = _first_pass_cache_entries_complete(first_pass_by_sector, sector_frames)
+    if not first_pass_complete:
+        st.info("Run the first-pass heavy detrend before retrieving/searching transit masks.")
+        return
 
-    transit_mask = _transit_mask_for_ephemerides(current_frame, ephemerides, width_durations=mask_width_durations) if mask_transits else None
-    masked_points = int(np.sum(transit_mask)) if transit_mask is not None else 0
-    if mask_transits:
-        if masked_points > 0:
-            st.caption(f"Wotan trend fit is ignoring {masked_points:,} ExoFOP-predicted in-transit point(s); the final flattened light curve keeps them.")
-        else:
-            st.warning("ExoFOP ephemerides were loaded, but none land in this sector. This sector will be flattened without transit masking.")
-    trend = _wotan_trend_with_method(
-        photometry_import_module,
-        current_frame,
-        window_length,
-        effective_method,
-        mask=transit_mask,
-    )
-    flattened = _flatten_sector_with_method(
-        photometry_import_module,
-        current_frame,
-        sector_uncertainties[sector_key],
-        window_length=window_length,
-        method=effective_method,
-        mask_transits=mask_transits,
-        mask_ephemerides=ephemerides,
-        mask_width_durations=mask_width_durations,
-        sigma_clip=sigma_clip,
-    )
-
-    trend_fig = photometry_import_module.sector_uncertainty_preview(normalized, trend=trend)
-    if transit_mask is not None and masked_points > 0:
-        masked = normalized.loc[np.asarray(transit_mask, dtype=bool)]
-        trend_fig.add_trace(
-            go.Scattergl(
-                x=masked["time"],
-                y=masked["flux"],
-                mode="markers",
-                marker=dict(color="#f59e0b", size=4, opacity=0.45),
-                name="masked from trend fit",
-            )
-        )
+    preview_key = st.selectbox("First-pass sector preview", list(sector_frames.keys()), key="ttv_first_pass_sector_select")
+    preview_first_pass = _read_first_pass_cache(first_pass_by_sector.get(preview_key))
+    if preview_first_pass.empty:
+        st.warning("The cached first-pass data for this sector was not found. Re-run the first-pass heavy detrend.")
+        return
+    preview_figure, preview_note = _first_pass_preview_figure(preview_first_pass)
+    if preview_note:
+        st.info(preview_note)
     st.plotly_chart(
-        trend_fig,
+        preview_figure,
         use_container_width=True,
         config=photometry_import_module.PLOT_CONFIG,
-        key=f"flattening_trend_{sector_key}",
+        key=f"ttv_first_pass_trend_{preview_key}",
     )
 
-    high_outliers = int(flattened["is_outlier"].sum())
-    kept = len(flattened) - high_outliers
-    cols = st.columns(3)
-    cols[0].metric("Points", f"{len(flattened):,}")
-    cols[1].metric("Kept after flattening", f"{kept:,}")
-    cols[2].metric("High outliers", f"{high_outliers:,}")
-    if st.button("Accept flattening for this sector", key=f"accept_flattening_{sector_key}"):
-        sector_flattening[sector_key] = {
-            "window_length": window_length,
-            "method": effective_method,
-            "mask_transits": mask_transits,
-            "mask_ephemerides": ephemerides,
-            "mask_planets": len(ephemerides),
-            "mask_width_durations": mask_width_durations,
-            "masked_points": masked_points,
-            "high_outliers": high_outliers,
-        }
-        st.session_state["sector_flattening"] = sector_flattening
-        st.success(f"Sector flattening accepted with a {window_length:.2f} day Wotan window using {effective_method}.")
+    accept_col, exofop_col = st.columns(2)
+    with accept_col:
+        accept_first_pass = st.button(
+            "accept the detrending as is and move on",
+            use_container_width=True,
+            key="ttv_accept_first_pass_as_final",
+        )
+    with exofop_col:
+        retrieve_exofop = st.button("get all exofop planet parameters", use_container_width=True, key="ttv_get_exofop_planets")
+
+    if accept_first_pass:
+        first_pass_window_value = float(st.session_state.get("ttv_first_pass_window", first_pass_window))
+        first_pass_cval_value = float(st.session_state.get("ttv_first_pass_cval", first_pass_cval))
+        new_flattening: dict[str, dict] = {}
+        for key, frame in sector_frames.items():
+            entry = first_pass_by_sector.get(key)
+            if isinstance(entry, dict):
+                high_outliers = int(entry.get("high_outliers", 0))
+                first_pass_cache_path = str(entry.get("path", ""))
+            else:
+                first_pass = _read_first_pass_cache(entry)
+                high_outliers = int(first_pass["is_outlier"].sum()) if "is_outlier" in first_pass else np.nan
+                first_pass_cache_path = str(entry) if entry else ""
+            new_flattening[key] = {
+                "window_length": first_pass_window_value,
+                "method": "biweight",
+                "cval": first_pass_cval_value,
+                "use_cached_first_pass": bool(first_pass_cache_path),
+                "first_pass_cache_path": first_pass_cache_path,
+                "mask_transits": False,
+                "mask_ephemerides": [],
+                "mask_planets": 0,
+                "mask_width_durations": np.nan,
+                "masked_points": 0,
+                "found_transits": 0,
+                "high_outliers": high_outliers,
+            }
+        st.session_state["sector_flattening"] = new_flattening
+        st.session_state.pop("prepared_sector_photometry", None)
+        st.session_state.pop("prepared_sector_summary", None)
+        st.session_state.pop("prepared_sector_directory", None)
+        st.session_state.pop("prepared_photometry", None)
+        st.session_state.pop("prepared_photometry_summary", None)
+        st.success(f"Accepted first-pass detrending for {len(new_flattening)} sector(s).")
+        st.rerun()
+
+    if retrieve_exofop:
+        with st.spinner("Retrieving ExoFOP planet parameters..."):
+            try:
+                ephemerides, message = _retrieve_exofop_ephemerides_for_flattening(photometry_fit_module)
+            except Exception as exc:  # noqa: BLE001 - resolver/network/table issue should be shown in the UI
+                st.session_state["ttv_exofop_planet_error"] = str(exc)
+                st.session_state.pop("ttv_exofop_planets", None)
+            else:
+                planets = _exofop_planet_rows_from_ephemerides(ephemerides)
+                if not planets.empty:
+                    st.session_state["ttv_exofop_planets"] = planets
+                    st.session_state["ttv_exofop_planet_message"] = message
+                    st.session_state.pop("ttv_exofop_planet_error", None)
+                else:
+                    st.session_state["ttv_exofop_planet_error"] = message
+                    st.session_state.pop("ttv_exofop_planets", None)
+        st.rerun()
+
+    if st.session_state.get("ttv_exofop_planet_error"):
+        st.warning(st.session_state["ttv_exofop_planet_error"])
+    if st.session_state.get("ttv_exofop_planet_message"):
+        st.caption(st.session_state["ttv_exofop_planet_message"])
+
+    planets = st.session_state.get("ttv_exofop_planets")
+    if not isinstance(planets, pd.DataFrame) or planets.empty:
+        st.info("Retrieve ExoFOP planet parameters before searching the first-pass data for transits.")
+        return
+
+    planets = planets.copy()
+    if "mask_duration_multiplier" not in planets:
+        planets["mask_duration_multiplier"] = 2.0
+    if "planet" not in planets:
+        planets["planet"] = [_planet_letter(index) for index in range(len(planets))]
+    else:
+        planets["planet"] = [
+            _planet_letter(index) if pd.isna(value) or not str(value).strip() or str(value).strip().lower() in {"nan", "none", "null"} else str(value).strip()
+            for index, value in enumerate(planets["planet"])
+        ]
+    st.caption("Set each planet's transit mask width as a multiple of its fitted transit duration before searching.")
+    mask_cols = st.columns(min(max(len(planets), 1), 4))
+    for display_index, (planet_index, row) in enumerate(planets.iterrows()):
+        planet_name = str(row.get("planet", _planet_letter(display_index)))
+        current_multiplier = _coerce_float(row.get("mask_duration_multiplier"), 2.0)
+        with mask_cols[display_index % len(mask_cols)]:
+            planets.at[planet_index, "mask_duration_multiplier"] = st.number_input(
+                f"{planet_name} mask width [x duration]",
+                min_value=0.5,
+                max_value=10.0,
+                value=float(current_multiplier if np.isfinite(current_multiplier) and current_multiplier > 0 else 2.0),
+                step=0.1,
+                format="%.2f",
+                key=f"ttv_mask_duration_multiplier_{planet_index}",
+            )
+    st.session_state["ttv_exofop_planets"] = planets
+
+    display_cols = ["planet", "t0", "period", "duration_hours", "mask_duration_multiplier", "radius_ratio", "impact"]
+    st.dataframe(planets[[col for col in display_cols if col in planets.columns]], use_container_width=True, hide_index=True)
+
+    search_half_width = st.number_input(
+        "Transit T0 search half-width [days]",
+        min_value=0.001,
+        max_value=5.0,
+        value=float(st.session_state.get("ttv_transit_search_half_width", 0.2)),
+        step=0.01,
+        format="%.4f",
+        key="ttv_transit_search_half_width_input",
+        help="Each ExoFOP-predicted transit midpoint is searched over this +/- range on the first-pass detrended data.",
+    )
+    if st.button("use planet parameters to search for transits", use_container_width=True, key="ttv_search_transits_from_planets"):
+        found_by_sector = {}
+        with st.spinner("Searching for transit centers in each sector..."):
+            progress = st.progress(0.0)
+            status_text = st.empty()
+            sector_items = list(first_pass_by_sector.items())
+            total_sectors = len(sector_items)
+            for index, (key, first_pass_entry) in enumerate(sector_items, start=1):
+                first_pass = _read_first_pass_cache(first_pass_entry)
+                if first_pass.empty:
+                    found_by_sector[key] = pd.DataFrame()
+                    progress.progress(index / total_sectors)
+                    continue
+                sector_label = first_pass["sector"].iloc[0] if "sector" in first_pass else key
+                status_text.caption(f"Searching sector {index}/{total_sectors}: {sector_label}")
+                found_by_sector[key] = _refine_transits_in_sector(
+                    first_pass,
+                    planets,
+                    float(search_half_width),
+                    grid_step_days=0.01,
+                )
+                del first_pass
+                gc.collect()
+                progress.progress(index / total_sectors)
+            status_text.caption(f"Transit search complete for {total_sectors} sector(s).")
+        st.session_state["ttv_found_transits"] = found_by_sector
+        st.session_state["ttv_transit_search_half_width"] = float(search_half_width)
+        st.session_state.pop("sector_flattening", None)
+        st.session_state.pop("prepared_photometry", None)
+        st.session_state.pop("prepared_photometry_summary", None)
+        total = sum(len(found) for found in found_by_sector.values())
+        st.success(f"Found/refined {total} transit window(s) across {len(found_by_sector)} sector(s).")
+        st.rerun()
+
+    found_by_sector = st.session_state.get("ttv_found_transits", {})
+    found_complete = isinstance(found_by_sector, dict) and set(found_by_sector) == set(sector_frames)
+    if not found_complete:
+        st.info("Search for transits before running the masked second-pass detrend.")
+        return
+
+    mask_preview_key = st.selectbox("Transit-mask sector preview", list(sector_frames.keys()), key="ttv_transit_mask_sector_select")
+    found_preview = found_by_sector.get(mask_preview_key, pd.DataFrame())
+    mask_preview_first_pass = _read_first_pass_cache(first_pass_by_sector.get(mask_preview_key))
+    if mask_preview_first_pass.empty:
+        st.warning("The cached first-pass data for this preview sector was not found. Re-run the first-pass heavy detrend.")
+        return
+    if isinstance(found_preview, pd.DataFrame) and not found_preview.empty:
+        st.plotly_chart(
+            _transit_search_preview_figure(mask_preview_first_pass, found_preview),
+            use_container_width=True,
+            config=photometry_import_module.PLOT_CONFIG,
+            key=f"ttv_transit_search_preview_{mask_preview_key}",
+        )
+        st.dataframe(
+            found_preview[["planet", "epoch", "expected_tmid", "tmid", "offset_days", "duration_hours", "mask_duration_multiplier", "points"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.warning("No transit windows were found in this preview sector.")
+
+    second_pass_window_col, second_pass_cval_col = st.columns([2, 1])
+    with second_pass_window_col:
+        second_pass_window = st.slider(
+            "2nd pass Wotan detrending window [days]",
+            min_value=0.1,
+            max_value=10.0,
+            value=float(st.session_state.get("ttv_second_pass_window", st.session_state.get("ttv_first_pass_window", 1.2))),
+            step=0.1,
+            key="ttv_second_pass_window_input",
+        )
+    with second_pass_cval_col:
+        second_pass_cval = st.slider(
+            "2nd pass Wotan robust cval",
+            min_value=1.0,
+            max_value=10.0,
+            value=float(st.session_state.get("ttv_second_pass_cval", st.session_state.get("ttv_first_pass_cval", 5.0))),
+            step=0.5,
+            key="ttv_second_pass_cval_input",
+            help="Robustness tuning passed to Wotan for the masked second-pass detrend.",
+        )
+    if st.button("accept the transit masking for all sectors and do 2nd pass detrending", use_container_width=True, key="ttv_accept_masks_second_pass"):
+        new_flattening: dict[str, dict] = {}
+        with st.spinner("Running second-pass Wotan detrend from original data with searched transits masked..."):
+            progress = st.progress(0.0)
+            status_text = st.empty()
+            sector_items = list(sector_frames.items())
+            total_sectors = len(sector_items)
+            for index, (key, frame) in enumerate(sector_items, start=1):
+                sector_label = frame["sector"].iloc[0] if not frame.empty and "sector" in frame else key
+                status_text.caption(f"Second-pass detrending sector {index}/{total_sectors}: {sector_label}")
+                found = found_by_sector.get(key, pd.DataFrame())
+                if not isinstance(found, pd.DataFrame):
+                    found = pd.DataFrame(found)
+                transit_mask = _mask_from_found_transits(frame, found)
+                prepared = _flatten_sector_with_explicit_mask(
+                    photometry_import_module,
+                    frame,
+                    sector_uncertainties[key],
+                    window_length=float(second_pass_window),
+                    method="biweight",
+                    transit_mask=transit_mask,
+                    cval=float(second_pass_cval),
+                    sigma_clip=sigma_clip,
+                )
+                new_flattening[key] = {
+                    "window_length": float(second_pass_window),
+                    "method": "biweight",
+                    "cval": float(second_pass_cval),
+                    "mask_transits": True,
+                    "mask_ephemerides": _ephemerides_from_planet_rows(planets),
+                    "mask_planets": int(planets["planet"].nunique()) if "planet" in planets else len(planets),
+                    "mask_width_durations": 1.5,
+                    "masked_points": int(np.sum(transit_mask)),
+                    "found_transits": int(len(found)),
+                    "mask_found_transits": found.to_dict("records"),
+                    "high_outliers": int(prepared["is_outlier"].sum()),
+                }
+                progress.progress(index / total_sectors)
+            status_text.caption(f"Second-pass masked detrend complete for {total_sectors} sector(s).")
+        st.session_state["sector_flattening"] = new_flattening
+        st.session_state["ttv_second_pass_window"] = float(second_pass_window)
+        st.session_state["ttv_second_pass_method"] = "biweight"
+        st.session_state["ttv_second_pass_cval"] = float(second_pass_cval)
+        st.success(f"Second-pass masked detrend accepted for {len(new_flattening)} sector(s).")
         st.rerun()
 
 
-def patch_photometry_loading_workflow(photometry_import_module) -> None:
+def patch_photometry_loading_workflow(photometry_import_module, photometry_fit_module=None) -> None:
     """Keep the imported photometry workflow visible before files are loaded."""
     if getattr(photometry_import_module, "_ttv_fitter_loading_workflow_patch", False):
         return
@@ -1116,12 +1872,13 @@ def patch_photometry_loading_workflow(photometry_import_module) -> None:
     original_flattening_status_table = photometry_import_module.flattening_status_table
     original_stitch_flattened_sectors = photometry_import_module.stitch_flattened_sectors
 
-    photometry_import_module.flatten_sector = lambda frame, uncertainty, *, window_length, sigma_clip=5.0: _flatten_sector_with_method(
+    photometry_import_module.flatten_sector = lambda frame, uncertainty, *, window_length, sigma_clip=5.0, cval=5.0: _flatten_sector_with_method(
         photometry_import_module,
         frame,
         uncertainty,
         window_length=window_length,
         method="biweight",
+        cval=cval,
         sigma_clip=sigma_clip,
     )
     photometry_import_module.flattening_status_table = _flattening_status_table_with_method
@@ -1240,33 +1997,133 @@ def patch_photometry_loading_workflow(photometry_import_module) -> None:
             st.rerun()
 
     def render_stitching(sigma_clip: float, stitch: bool) -> None:
+        st.subheader("3. Stitch sectors (optional)")
         if not st.session_state.get("sector_frames", {}):
-            _render_waiting_step(
-                "3. Stitch sectors",
-                "Available after sector uncertainties and flattening are complete.",
-            )
+            st.info("Waiting")
+            st.caption("Available after sector uncertainties and flattening are complete.")
             return
         sector_frames = st.session_state.get("sector_frames", {})
         sector_uncertainties = st.session_state.get("sector_uncertainties", {})
         sector_flattening = st.session_state.get("sector_flattening", {})
         if not _workflow_sets_complete(sector_uncertainties, sector_frames):
-            _render_waiting_step(
-                "3. Stitch sectors",
-                "Waiting for uncertainty review to finish.",
-            )
+            st.info("Waiting")
+            st.caption("Waiting for uncertainty review to finish.")
             return
         if not _workflow_sets_complete(sector_flattening, sector_frames):
             missing = len(set(sector_frames) - set(sector_flattening))
-            _render_waiting_step(
-                "3. Stitch sectors",
-                f"Waiting for flattening review to finish. Missing: {missing}.",
-            )
+            st.info("Waiting")
+            st.caption(f"Waiting for flattening review to finish. Missing: {missing}.")
             return
+
+        if st.button("Download data as sectors", use_container_width=True, key="download_prepared_sector_files_button"):
+            progress = st.progress(0.0)
+            status_text = st.empty()
+
+            def update_sector_progress(index: int, total: int, key: str, frame: pd.DataFrame) -> None:
+                sector_label = frame["sector"].iloc[0] if not frame.empty and "sector" in frame else key
+                status_text.caption(f"Preparing sector file {index}/{total}: {sector_label}")
+                progress.progress(index / max(total, 1))
+
+            with st.spinner("Preparing sector CSV files..."):
+                sector_tables, sector_summary = _prepared_sector_tables_with_method(
+                    photometry_import_module,
+                    sector_frames,
+                    sector_uncertainties,
+                    sector_flattening,
+                    sigma_clip=sigma_clip,
+                    progress_callback=update_sector_progress,
+                )
+                target_part = photometry_import_module._target_filename_part()
+                sector_dir = Path("data") / "prepared" / target_part / "sectors"
+                sector_dir.mkdir(parents=True, exist_ok=True)
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for key, table in sector_tables.items():
+                        sector_label = str(table["sector"].iloc[0]) if "sector" in table and not table.empty else str(key)
+                        clean_sector = re.sub(r"[^A-Za-z0-9_.-]+", "_", sector_label).strip("_") or str(key)
+                        filename = f"{target_part}_sector_{clean_sector}.csv"
+                        export = table.loc[~table["is_outlier"], ["time", "flux", "flux_err", "source_file", "sector"]].copy()
+                        local_path = sector_dir / filename
+                        export.to_csv(local_path, index=False)
+                        archive.writestr(f"sectors/{filename}", export.to_csv(index=False))
+                    archive.writestr("sectors/sector_summary.csv", sector_summary.to_csv(index=False))
+                zip_buffer.seek(0)
+            st.session_state["prepared_sector_photometry"] = sector_tables
+            st.session_state["prepared_sector_summary"] = sector_summary
+            st.session_state["prepared_sector_directory"] = str(sector_dir)
+            status_text.caption(f"Prepared {len(sector_tables)} sector file(s) in {sector_dir}.")
+            st.download_button(
+                "Download prepared sector CSV bundle",
+                data=zip_buffer.getvalue(),
+                file_name=f"{target_part}_sectors.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="download_prepared_sector_zip",
+            )
+            st.success(f"Sector CSV files written to {sector_dir}.")
+
         had_prepared = st.session_state.get("prepared_photometry") is not None
-        original_stitching(sigma_clip, stitch)
+        if st.button("Prepare stitched photometry", type="primary", disabled=not stitch):
+            progress = st.progress(0.0)
+            status_text = st.empty()
+
+            def update_progress(index: int, total: int, key: str, frame: pd.DataFrame) -> None:
+                sector_label = frame["sector"].iloc[0] if not frame.empty and "sector" in frame else key
+                status_text.caption(f"Stitching sector {index}/{total}: {sector_label}")
+                progress.progress(index / max(total, 1))
+
+            with st.spinner("Preparing stitched photometry..."):
+                stitched, summary = _stitch_flattened_sectors_with_method(
+                    photometry_import_module,
+                    sector_frames,
+                    sector_uncertainties,
+                    sector_flattening,
+                    sigma_clip=sigma_clip,
+                    progress_callback=update_progress,
+                )
+            status_text.caption(f"Stitched {len(summary)} sector file(s) into {len(stitched):,} photometry point(s).")
+            st.session_state["prepared_photometry"] = stitched
+            st.session_state["prepared_photometry_summary"] = summary
+            st.success("Stitched photometry prepared.")
         has_prepared = st.session_state.get("prepared_photometry") is not None
         if has_prepared and not had_prepared:
             st.rerun()
+
+    def render_prepared_photometry() -> None:
+        stitched = st.session_state.get("prepared_photometry")
+        summary = st.session_state.get("prepared_photometry_summary")
+        if stitched is None or summary is None:
+            return
+
+        st.subheader("Prepared stitched photometry")
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Files", f"{len(summary)}")
+        metric_cols[1].metric("Points", f"{len(stitched):,}")
+        metric_cols[2].metric("Outliers", f"{int(stitched['is_outlier'].sum()):,}")
+        metric_cols[3].metric("Sectors", f"{stitched['sector'].nunique()}")
+
+        if len(stitched) > 100_000:
+            st.info(
+                f"Skipping the stitched photometry plot because this dataset has {len(stitched):,} points. "
+                "The full dataset is still available in the table summary and CSV download."
+            )
+        else:
+            st.plotly_chart(
+                photometry_import_module.prepared_photometry_preview(stitched),
+                use_container_width=True,
+                config=photometry_import_module.PLOT_CONFIG,
+                key="prepared_photometry_preview",
+            )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        export = stitched.loc[~stitched["is_outlier"], ["time", "flux", "flux_err", "source_file", "sector"]].copy()
+        st.download_button(
+            "Download prepared photometry CSV",
+            data=export.to_csv(index=False).encode("utf-8"),
+            file_name=f"prepared_photometry_{photometry_import_module._target_filename_part()}.csv",
+            mime="text/csv",
+            key="download_prepared_photometry",
+        )
 
     photometry_import_module._render_downloaded_files = render_sector_files
     if original_uploaded_files is not None:
@@ -1275,6 +2132,7 @@ def patch_photometry_loading_workflow(photometry_import_module) -> None:
     photometry_import_module._render_uncertainty_workflow = render_uncertainty
     photometry_import_module._render_flattening_workflow = render_flattening
     photometry_import_module._render_stitching_controls = render_stitching
+    photometry_import_module._render_prepared_photometry = render_prepared_photometry
     photometry_import_module._ttv_fitter_original_downloaded_files = original_downloaded_files
     photometry_import_module._ttv_fitter_original_uploaded_files = original_uploaded_files
     photometry_import_module._ttv_fitter_original_loaded_file_prompt = original_loaded_file_prompt
@@ -1332,7 +2190,12 @@ def patch_fast_uncertainty_preview(plots_module, photometry_import_module) -> No
 
         fig = go.Figure()
         marker_opacity = 0.32 if trend is not None else 0.55
-        display_frame = _sample_photometry_for_plot(frame, max_points=10_000) if trend is None else frame
+        stride = _simple_plot_stride(len(frame))
+        display_frame = frame.iloc[::stride].copy() if stride > 1 else frame
+        display_trend = None
+        if trend is not None and len(trend) == len(frame):
+            trend_array = np.asarray(trend, dtype=float)
+            display_trend = trend_array[::stride] if stride > 1 else trend_array
         fig.add_trace(
             go.Scattergl(
                 x=display_frame["time"],
@@ -1365,11 +2228,11 @@ def patch_fast_uncertainty_preview(plots_module, photometry_import_module) -> No
                         name="Flux uncertainty sample",
                     )
                 )
-        if trend is not None and len(trend) == len(frame):
+        if display_trend is not None:
             fig.add_trace(
                 go.Scattergl(
-                    x=frame["time"],
-                    y=trend,
+                    x=display_frame["time"],
+                    y=display_trend,
                     mode="lines",
                     line={"color": "#ef4444", "width": 3},
                     name="Wotan trend",
@@ -1377,14 +2240,22 @@ def patch_fast_uncertainty_preview(plots_module, photometry_import_module) -> No
             )
         fig = plots_module._base_layout(fig, "Sector uncertainty review", "Time - BTJD", "Relative flux")
         fig.update_layout(uirevision="sector_uncertainty_review")
-        if trend is None and len(frame) > len(display_frame):
+        if stride > 1:
+            note = f"Only every {_ordinal_word(stride)} data point is plotted to save memory ({len(display_frame):,} of {len(frame):,} points shown)."
             fig.update_layout(
                 meta={
-                    "ttv_sampled_plot_note": (
-                        f"This plot shows a reduced-size display sample ({len(display_frame):,} of {len(frame):,} points) "
-                        "to keep the browser responsive. The uncertainty bars are also sampled for display."
-                    )
+                    "ttv_sampled_plot_note": note
                 }
+            )
+            fig.add_annotation(
+                text=note,
+                x=0.01,
+                y=1.06,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                align="left",
+                font={"size": 12, "color": "#64748b"},
             )
         return fig
 
@@ -1392,6 +2263,20 @@ def patch_fast_uncertainty_preview(plots_module, photometry_import_module) -> No
     plots_module.sector_uncertainty_preview = fast_sector_uncertainty_preview
     photometry_import_module.sector_uncertainty_preview = fast_sector_uncertainty_preview
     plots_module._ttv_fitter_fast_uncertainty_patch = True
+
+
+def _simple_plot_stride(point_count: int) -> int:
+    if point_count > 75_000:
+        return 4
+    if point_count > 50_000:
+        return 3
+    if point_count > 25_000:
+        return 2
+    return 1
+
+
+def _ordinal_word(value: int) -> str:
+    return {2: "second", 3: "third", 4: "fourth"}.get(int(value), f"{int(value)}th")
 
 
 def _sample_photometry_for_plot(frame: pd.DataFrame, max_points: int = 12_000) -> pd.DataFrame:
@@ -1462,19 +2347,20 @@ def patch_lightweight_photometry_plots(plots_module, photometry_import_module, p
     def lightweight_prepared_photometry_preview(frame: pd.DataFrame) -> go.Figure:
         if frame is None or frame.empty:
             return original_prepared_preview(frame)
-        display = _sample_photometry_for_plot(frame, max_points=12_000)
+        stride = _simple_display_stride(len(frame), max_display_points=20_000)
+        display = frame.iloc[::stride].copy() if stride > 1 else frame
+        if "is_outlier" not in display.columns:
+            display["is_outlier"] = False
         fig = original_prepared_preview(display)
-        if len(frame) > len(display):
+        if stride > 1:
+            note = _stride_note(len(frame), len(display), stride)
             fig.update_layout(
                 meta={
-                    "ttv_sampled_plot_note": (
-                        f"This plot shows a reduced-size display sample ({len(display):,} of {len(frame):,} points) "
-                        "to keep the browser responsive. Fits and exports still use the full dataset."
-                    )
+                    "ttv_sampled_plot_note": note
                 }
             )
             fig.add_annotation(
-                text=f"displaying {len(display):,} of {len(frame):,} points",
+                text=note,
                 x=0.01,
                 y=0.98,
                 xref="paper",
@@ -1692,6 +2578,28 @@ def _stellar_values_from_prior_table(
     return float(stellar_mass), float(stellar_radius)
 
 
+def _repair_host_prior_parameter_names(table: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Restore host stellar parameter labels if a Streamlit editor returns blanks."""
+    if not isinstance(table, pd.DataFrame) or table.empty or "planet" not in table.columns or "parameter" not in table.columns:
+        return table
+    repaired = table.copy()
+    host_indices = list(repaired.index[repaired["planet"].astype(str).str.lower() == "host"])
+    if not host_indices:
+        return repaired
+
+    parameters = repaired["parameter"].astype(str).str.strip().str.lower()
+    missing = [name for name in ["stellar_mass", "stellar_radius"] if name not in set(parameters)]
+    if not missing:
+        return repaired
+
+    blank_values = {"", "nan", "none", "<na>"}
+    for idx, name in zip(host_indices, ["stellar_mass", "stellar_radius"]):
+        value = str(repaired.at[idx, "parameter"]).strip().lower()
+        if value in blank_values and name in missing:
+            repaired.at[idx, "parameter"] = name
+    return repaired
+
+
 def patch_photometry_fit_prior_bounds(photometry_fit_module) -> None:
     """Round ExoFOP-seeded uniform bounds to easier-to-read intervals."""
     if getattr(photometry_fit_module, "_ttv_fitter_prior_bounds_patch", False):
@@ -1792,11 +2700,13 @@ def patch_photometry_fit_impact_factor_language(photometry_fit_module) -> None:
 
     original_build_params = photometry_fit_module._build_allesfitter_params_from_setup
     original_run_least_squares = photometry_fit_module._run_least_squares_refinement
+    original_setup = photometry_fit_module._render_transit_parameter_setup
     original_render = photometry_fit_module.render
 
     def build_params_with_impact_factor_labels(*args, **kwargs):
         if args and isinstance(args[0], pd.DataFrame):
-            planet_table = args[0].copy()
+            planet_table = _repair_host_prior_parameter_names(args[0])
+            planet_table = planet_table.copy() if isinstance(planet_table, pd.DataFrame) else args[0].copy()
             stellar_mass = args[2] if len(args) > 2 else kwargs.get("stellar_mass", 1.0)
             stellar_radius = args[3] if len(args) > 3 else kwargs.get("stellar_radius", 1.0)
             stellar_mass, stellar_radius = _stellar_values_from_prior_table(planet_table, stellar_mass, stellar_radius)
@@ -1814,6 +2724,7 @@ def patch_photometry_fit_impact_factor_language(photometry_fit_module) -> None:
         *args,
         **kwargs,
     ):
+        planet_table = _repair_host_prior_parameter_names(planet_table)
         stellar_mass, stellar_radius = _stellar_values_from_prior_table(planet_table, stellar_mass, stellar_radius)
         return original_run_least_squares(
             data,
@@ -1825,20 +2736,25 @@ def patch_photometry_fit_impact_factor_language(photometry_fit_module) -> None:
             **kwargs,
         )
 
-    def render_with_impact_factor_note() -> None:
+    def patched_setup_context(render_call):
         original_data_editor = st.data_editor
         original_dataframe = st.dataframe
         original_number_input = st.number_input
+        original_button = st.button
+        original_plotly_chart = st.plotly_chart
+        original_success = st.success
         delta_generator_cls = type(st.container())
         original_delta_number_input = delta_generator_cls.number_input
+        original_batman_model = photometry_fit_module._batman_model_on_data
 
         def hidden_stellar_number_input(label, *args, original_call=None, **kwargs):
             label_text = str(label)
-            if label_text in {"Stellar mass [Msun]", "Stellar radius [Rsun]"}:
+            if ("Stellar mass" in label_text and "Msun" in label_text) or ("Stellar radius" in label_text and "Rsun" in label_text):
                 fallback = _coerce_float(kwargs.get("value"), 1.0)
                 table = st.session_state.get("phot_fit_latest_edited_priors")
                 if not isinstance(table, pd.DataFrame):
                     table = st.session_state.get("phot_fit_planet_priors_data")
+                table = _repair_host_prior_parameter_names(table)
                 mass, radius = _stellar_values_from_prior_table(table, fallback, fallback)
                 return mass if label_text.startswith("Stellar mass") else radius
             return (original_call or original_number_input)(label, *args, **kwargs)
@@ -1858,6 +2774,7 @@ def patch_photometry_fit_impact_factor_language(photometry_fit_module) -> None:
 
         def data_editor_with_impact_factor_language(data=None, *args, **kwargs):
             if isinstance(data, pd.DataFrame) and "parameter" in data.columns:
+                data = _repair_host_prior_parameter_names(data)
                 parameters = set(data["parameter"].astype(str))
                 planet_parameter_names = {
                     "T0",
@@ -1888,6 +2805,7 @@ def patch_photometry_fit_impact_factor_language(photometry_fit_module) -> None:
                 if isinstance(edited, pd.DataFrame) and "parameter" in edited.columns:
                     edited = edited.copy()
                     edited["parameter"] = edited["parameter"].replace({"impact_factor": "impact"})
+                    edited = _repair_host_prior_parameter_names(edited)
                 return edited
             return original_data_editor(data, *args, **kwargs)
 
@@ -1898,23 +2816,86 @@ def patch_photometry_fit_impact_factor_language(photometry_fit_module) -> None:
                 st.info(_impact_factor_note())
             return result
 
+        def button_with_separate_param_generation(label, *args, **kwargs):
+            label_text = str(label)
+            if label_text != "Generate table and initial model from current priors":
+                return original_button(label, *args, **kwargs)
+
+            button_kwargs = dict(kwargs)
+            button_kwargs.pop("key", None)
+            cols = st.columns(2)
+            with cols[0]:
+                params_clicked = original_button(
+                    "Generate params table from current priors",
+                    *args,
+                    key="phot_fit_generate_params_only",
+                    **button_kwargs,
+                )
+            model_kwargs = dict(button_kwargs)
+            model_kwargs.pop("type", None)
+            with cols[1]:
+                model_clicked = original_button(
+                    "Generate initial model from generated table",
+                    *args,
+                    key="phot_fit_generate_initial_model_only",
+                    **model_kwargs,
+                )
+            st.session_state["_ttv_generate_initial_model_clicked"] = bool(model_clicked)
+            return bool(params_clicked or model_clicked)
+
+        def batman_model_only_when_requested(*args, **kwargs):
+            if st.session_state.get("_ttv_generate_initial_model_clicked"):
+                return original_batman_model(*args, **kwargs)
+            return None
+
+        def plotly_chart_without_empty_initial_model(fig, *args, **kwargs):
+            if kwargs.get("key") == "phot_fit_initial_model_overlay" and st.session_state.get("phot_fit_initial_model") is None:
+                st.info("Generated the parameter table only. Use the separate initial-model button to evaluate and plot the model over loaded data.")
+                return None
+            return original_plotly_chart(fig, *args, **kwargs)
+
+        def success_with_split_generate_message(body, *args, **kwargs):
+            if (
+                str(body) == "Generated allesfitter parameters and initial BATMAN model from the current prior table."
+                and not st.session_state.get("_ttv_generate_initial_model_clicked")
+            ):
+                body = "Generated allesfitter parameters from the current prior table. Initial model generation was skipped."
+            return original_success(body, *args, **kwargs)
+
         st.data_editor = data_editor_with_impact_factor_language
         st.dataframe = dataframe_with_geometry_note
         st.number_input = hidden_stellar_number_input
+        st.button = button_with_separate_param_generation
+        st.plotly_chart = plotly_chart_without_empty_initial_model
+        st.success = success_with_split_generate_message
         delta_generator_cls.number_input = hidden_stellar_delta_number_input
+        photometry_fit_module._batman_model_on_data = batman_model_only_when_requested
         try:
-            return original_render()
+            return render_call()
         finally:
             st.data_editor = original_data_editor
             st.dataframe = original_dataframe
             st.number_input = original_number_input
+            st.button = original_button
+            st.plotly_chart = original_plotly_chart
+            st.success = original_success
             delta_generator_cls.number_input = original_delta_number_input
+            photometry_fit_module._batman_model_on_data = original_batman_model
+
+    def render_setup_with_impact_factor_note() -> None:
+        st.session_state.pop("_ttv_generate_initial_model_clicked", None)
+        return patched_setup_context(original_setup)
+
+    def render_with_impact_factor_note() -> None:
+        return original_render()
 
     photometry_fit_module._build_allesfitter_params_from_setup = build_params_with_impact_factor_labels
     photometry_fit_module._run_least_squares_refinement = run_least_squares_with_host_rows
+    photometry_fit_module._render_transit_parameter_setup = render_setup_with_impact_factor_note
     photometry_fit_module.render = render_with_impact_factor_note
     photometry_fit_module._ttv_fitter_original_build_params_for_impact_language = original_build_params
     photometry_fit_module._ttv_fitter_original_run_least_squares_for_host_rows = original_run_least_squares
+    photometry_fit_module._ttv_fitter_original_transit_parameter_setup_for_host_rows = original_setup
     photometry_fit_module._ttv_fitter_impact_factor_language_patch = True
 
 
@@ -2415,6 +3396,149 @@ def bridge_fit_planets() -> None:
         st.session_state["planets"] = coerce_planet_table(pd.DataFrame(rows))
 
 
+def _clean_fit_sector_table(frame: pd.DataFrame, source: str) -> pd.DataFrame:
+    data = normalize_photometry(frame)
+    if "source_file" not in data:
+        data["source_file"] = source
+    if "sector" not in data:
+        data["sector"] = Path(source).stem
+    if "is_outlier" not in data:
+        data["is_outlier"] = False
+    return data
+
+
+def _sector_tables_from_directory(directory: str) -> dict[str, pd.DataFrame]:
+    root = Path(str(directory)).expanduser()
+    if not root.exists() or not root.is_dir():
+        return {}
+    tables: dict[str, pd.DataFrame] = {}
+    for path in sorted(root.glob("*.csv")):
+        if path.name.lower() == "sector_summary.csv":
+            continue
+        try:
+            table = _clean_fit_sector_table(pd.read_csv(path), path.name)
+        except Exception:
+            continue
+        if not table.empty:
+            key = str(table["sector"].iloc[0]) if "sector" in table else path.stem
+            tables[key] = table
+    return tables
+
+
+def _default_sector_directory() -> str:
+    prepared = st.session_state.get("prepared_sector_directory")
+    if prepared:
+        return str(prepared)
+    target = _target_name_for_exofop_lookup()
+    clean_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target or "TOI-216")).strip("_") or "TOI-216"
+    return str(Path("data") / "prepared" / clean_target / "sectors")
+
+
+def _load_linear_fit_data_from_tables(tables: dict[str, pd.DataFrame], source: str) -> None:
+    cleaned = {str(key): _clean_fit_sector_table(table, str(key)) for key, table in tables.items() if isinstance(table, pd.DataFrame) and not table.empty}
+    if not cleaned:
+        return
+    combined = pd.concat(cleaned.values(), ignore_index=True).sort_values("time").reset_index(drop=True)
+    st.session_state["photometry_fit_sector_data"] = cleaned
+    st.session_state["photometry_fit_data_mode"] = "sectors"
+    st.session_state["photometry_fit_data"] = combined
+    st.session_state["photometry_fit_data_source"] = source
+
+
+def _load_linear_fit_stitched_data(frame: pd.DataFrame, source: str) -> None:
+    data = _clean_fit_sector_table(frame, source).sort_values("time").reset_index(drop=True)
+    st.session_state["photometry_fit_data"] = data
+    st.session_state["photometry_fit_data_source"] = source
+    st.session_state["photometry_fit_data_mode"] = "stitched"
+    st.session_state.pop("photometry_fit_sector_data", None)
+
+
+def _render_linear_fit_data_loader(photometry_fit_module) -> None:
+    st.subheader("Load photometry data")
+    prepared = st.session_state.get("prepared_photometry")
+    prepared_sectors = st.session_state.get("prepared_sector_photometry")
+
+    import_col, sector_col, dir_col = st.columns(3, vertical_alignment="top")
+    with import_col:
+        st.caption("Use the stitched data from the TTV data preparation workflow.")
+        if isinstance(prepared, pd.DataFrame) and not prepared.empty:
+            if st.button("Import stitched data from data preparation", use_container_width=True, type="primary"):
+                export = prepared.loc[~prepared["is_outlier"]].copy() if "is_outlier" in prepared else prepared.copy()
+                _load_linear_fit_stitched_data(export, "TTV data preparation stitched data")
+                st.rerun()
+        else:
+            st.button("Import stitched data from data preparation", use_container_width=True, disabled=True)
+            st.info("No stitched prepared data is available yet.")
+
+    with sector_col:
+        st.caption("Use the unstitched sector tables prepared in the previous tab.")
+        if isinstance(prepared_sectors, dict) and prepared_sectors:
+            if st.button("Import sector data from data preparation", use_container_width=True):
+                _load_linear_fit_data_from_tables(prepared_sectors, "TTV data preparation sector data")
+                st.rerun()
+        else:
+            st.button("Import sector data from data preparation", use_container_width=True, disabled=True)
+            st.info("Prepare sector data first, or load a sector directory.")
+
+    with dir_col:
+        st.caption("Load a local directory containing one prepared CSV per sector.")
+        directory = st.text_input("Sector directory", value=_default_sector_directory(), key="photometry_fit_sector_directory")
+        if st.button("Load sector directory", use_container_width=True):
+            tables = _sector_tables_from_directory(directory)
+            if not tables:
+                st.warning("No usable sector CSV files were found in that directory.")
+            else:
+                _load_linear_fit_data_from_tables(tables, f"Sector directory: {directory}")
+                st.success(f"Loaded {len(tables)} sector file(s).")
+                st.rerun()
+
+    uploaded = st.file_uploader(
+        "Or load prepared photometry CSV",
+        type=["csv"],
+        key="photometry_fit_csv_upload",
+        help="Expected columns: time, flux, flux_err. Optional columns such as sector and source_file are kept.",
+    )
+    if uploaded is not None:
+        try:
+            frame = pd.read_csv(uploaded)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not read CSV: {exc}")
+        else:
+            if st.button("Use uploaded CSV", use_container_width=True):
+                _load_linear_fit_stitched_data(frame, uploaded.name)
+                st.rerun()
+
+    data = st.session_state.get("photometry_fit_data")
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return
+
+    mode = st.session_state.get("photometry_fit_data_mode", "stitched")
+    st.caption(f"Current fit data source: {st.session_state.get('photometry_fit_data_source', 'unknown')}")
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Points", f"{len(data):,}")
+    metric_cols[1].metric("Sectors", f"{data['sector'].nunique() if 'sector' in data else 0}")
+    metric_cols[2].metric("Time min", f"{data['time'].min():.4f}")
+    metric_cols[3].metric("Time max", f"{data['time'].max():.4f}")
+
+    plot_data = data
+    if mode == "sectors":
+        sector_tables = st.session_state.get("photometry_fit_sector_data", {})
+        if isinstance(sector_tables, dict) and sector_tables:
+            sector_key = st.selectbox("Sector to plot", list(sector_tables.keys()), key="photometry_fit_sector_plot_select")
+            plot_data = sector_tables[sector_key]
+    plot_stride = _simple_display_stride(len(plot_data), max_display_points=20_000)
+    if plot_stride > 1:
+        displayed_points = len(plot_data.iloc[::plot_stride])
+        st.info(f"{_stride_note(len(plot_data), displayed_points, plot_stride)} Fits still use all loaded rows.")
+
+    st.plotly_chart(
+        photometry_fit_module.prepared_photometry_preview(plot_data),
+        use_container_width=True,
+        config=photometry_fit_module.PLOT_CONFIG,
+        key="photometry_fit_loaded_data_preview",
+    )
+
+
 def _single_transit_data_sources() -> dict[str, pd.DataFrame]:
     sources: dict[str, pd.DataFrame] = {}
     for label, key in [
@@ -2510,16 +3634,30 @@ def _single_transit_start_values(planet_name: str, data: pd.DataFrame) -> dict[s
     return {key: float(value) for key, value in defaults.items()}
 
 
-def _single_transit_window_figure(data: pd.DataFrame, start: float | None, end: float | None) -> go.Figure:
+def _single_transit_plot_frame(data: pd.DataFrame, max_display_points: int = 20_000) -> tuple[pd.DataFrame, int]:
+    stride = _simple_display_stride(len(data), max_display_points=max_display_points)
+    if stride <= 1:
+        return data, 1
+    return data.iloc[::stride].copy(), stride
+
+
+def _single_transit_window_figure(
+    data: pd.DataFrame,
+    start: float | None,
+    end: float | None,
+    *,
+    show_errors: bool = False,
+    marker_opacity: float = 0.38,
+) -> go.Figure:
     fig = go.Figure()
-    err = data["flux_err"] if "flux_err" in data.columns else None
+    err = data["flux_err"] if show_errors and "flux_err" in data.columns else None
     fig.add_trace(
         go.Scattergl(
             x=data["time"],
             y=data["flux"],
             error_y=dict(type="data", array=err, visible=err is not None),
             mode="markers",
-            marker=dict(size=4, color="#2563eb", opacity=0.45),
+            marker=dict(size=4, color="#2563eb", opacity=marker_opacity),
             name="photometry",
         )
     )
@@ -2539,7 +3677,8 @@ def _single_transit_window_figure(data: pd.DataFrame, start: float | None, end: 
 def _single_transit_fit_figure(data: pd.DataFrame, fit: dict[str, float]) -> go.Figure:
     from .models import limb_darkened_transit_model
 
-    fig = _single_transit_window_figure(data, None, None)
+    plot_data, _stride = _single_transit_plot_frame(data)
+    fig = _single_transit_window_figure(plot_data, None, None, show_errors=False, marker_opacity=0.24)
     time = np.linspace(float(data["time"].min()), float(data["time"].max()), 800)
     model = limb_darkened_transit_model(
         time,
@@ -2553,7 +3692,15 @@ def _single_transit_fit_figure(data: pd.DataFrame, fit: dict[str, float]) -> go.
         baseline_offset=float(fit.get("baseline_offset", 0.0)),
         a_over_rstar=float(fit.get("a_over_rstar", np.nan)),
     )
-    fig.add_trace(go.Scatter(x=time, y=model, mode="lines", line=dict(color="#ef4444", width=4), name="single-transit LS fit"))
+    fig.add_trace(
+        go.Scattergl(
+            x=time,
+            y=model,
+            mode="lines",
+            line=dict(color="#ef4444", width=6),
+            name="single-transit LS fit",
+        )
+    )
     return fig
 
 
@@ -2607,6 +3754,7 @@ def _exofop_single_transit_seed(planet_name: str, data: pd.DataFrame) -> dict[st
 def _render_single_transit_fit_subtab() -> None:
     st.subheader("Fit One Transit")
     st.caption("Use one clean transit to estimate the transit shape when large TTVs make a global linear-transit fit unreliable.")
+    bridge_fit_planets()
 
     upload = st.file_uploader(
         "Upload photometry table for single-transit fitting",
@@ -2638,7 +3786,19 @@ def _render_single_transit_fit_subtab() -> None:
         return
 
     planets = coerce_planet_table(st.session_state.get("planets"))
-    planet_name = st.selectbox("Planet", planets["name"].astype(str).tolist(), key="single_transit_planet")
+    if planets.empty:
+        st.info("Create or retrieve planet parameters first so each planet can be fit separately.")
+        return
+    planet_options = []
+    planet_lookup = {}
+    for _, row in planets.iterrows():
+        name = str(row.get("name", ""))
+        period = _coerce_float(row.get("period"), np.nan)
+        label = f"{name} - period {period:.6g}d" if np.isfinite(period) else name
+        planet_options.append(label)
+        planet_lookup[label] = name
+    planet_label = st.selectbox("Planet", planet_options, key="single_transit_planet")
+    planet_name = planet_lookup[planet_label]
     defaults = _single_transit_start_values(planet_name, data)
 
     tmin = float(data["time"].min())
@@ -2647,6 +3807,29 @@ def _render_single_transit_fit_subtab() -> None:
     if not tmin <= center <= tmax:
         center = float(data["time"].median())
     width = min(max(float(defaults.get("duration_hours", 3.0)) / 12.0, (tmax - tmin) * 0.05), max(tmax - tmin, 1e-6))
+
+    pending_seed = st.session_state.pop("_single_transit_pending_exofop_seed", None)
+    if isinstance(pending_seed, dict):
+        key_map = {
+            "t0": "single_transit_t0",
+            "period": "single_transit_period",
+            "radius_ratio": "single_transit_radius_ratio",
+            "impact": "single_transit_impact",
+            "duration_hours": "single_transit_duration",
+            "a_over_rstar": "single_transit_a_over_rstar",
+            "limb_darkening_u1": "single_transit_u1",
+            "limb_darkening_u2": "single_transit_u2",
+            "baseline_offset": "single_transit_baseline_offset",
+        }
+        for name, key in key_map.items():
+            if name in pending_seed:
+                st.session_state[key] = float(pending_seed[name])
+        if "t0" in pending_seed and "duration_hours" in pending_seed:
+            half_width = max(float(pending_seed["duration_hours"]) / 12.0, 0.05)
+            st.session_state["single_transit_window_start"] = float(np.clip(float(pending_seed["t0"]) - half_width, tmin, tmax))
+            st.session_state["single_transit_window_end"] = float(np.clip(float(pending_seed["t0"]) + half_width, tmin, tmax))
+        st.success("Seeded single-transit start points from ExoFOP.")
+
     st.session_state.setdefault("single_transit_window_start", max(tmin, center - width))
     st.session_state.setdefault("single_transit_window_end", min(tmax, center + width))
     start = float(np.clip(st.session_state["single_transit_window_start"], tmin, tmax))
@@ -2654,8 +3837,12 @@ def _render_single_transit_fit_subtab() -> None:
     st.session_state["single_transit_window_start"] = start
     st.session_state["single_transit_window_end"] = end
 
+    plot_data, plot_stride = _single_transit_plot_frame(data)
+    if plot_stride > 1:
+        st.info(f"{_stride_note(len(data), len(plot_data), plot_stride)} Fitting still uses every point in the selected window.")
+
     selection = st.plotly_chart(
-        _single_transit_window_figure(data, start, end),
+        _single_transit_window_figure(plot_data, start, end, show_errors=False),
         width="stretch",
         key="single_transit_window_plot",
         on_select="rerun",
@@ -2683,25 +3870,7 @@ def _render_single_transit_fit_subtab() -> None:
         if not seed:
             st.warning("No ExoFOP row is available yet. Use the ExoFOP retrieval on the Linear fit subtab first.")
         else:
-            key_map = {
-                "t0": "single_transit_t0",
-                "period": "single_transit_period",
-                "radius_ratio": "single_transit_radius_ratio",
-                "impact": "single_transit_impact",
-                "duration_hours": "single_transit_duration",
-                "a_over_rstar": "single_transit_a_over_rstar",
-                "limb_darkening_u1": "single_transit_u1",
-                "limb_darkening_u2": "single_transit_u2",
-                "baseline_offset": "single_transit_baseline_offset",
-            }
-            for name, key in key_map.items():
-                if name in seed:
-                    st.session_state[key] = float(seed[name])
-            if "t0" in seed and "duration_hours" in seed:
-                half_width = max(float(seed["duration_hours"]) / 12.0, 0.05)
-                st.session_state["single_transit_window_start"] = float(np.clip(seed["t0"] - half_width, tmin, tmax))
-                st.session_state["single_transit_window_end"] = float(np.clip(seed["t0"] + half_width, tmin, tmax))
-            st.success("Seeded single-transit start points from ExoFOP.")
+            st.session_state["_single_transit_pending_exofop_seed"] = seed
             st.rerun()
 
     param_cols = st.columns(4)
@@ -2733,6 +3902,8 @@ def _render_single_transit_fit_subtab() -> None:
         default=[name for name in fit_options if name != "period"],
         key="single_transit_fit_parameters",
     )
+    if "duration_hours" in fit_parameters and np.isfinite(float(defaults.get("a_over_rstar", np.nan))):
+        st.caption("Duration is kept fixed when a/Rstar is available, because those two controls are degenerate for this single-transit model.")
     if st.button("Run single-transit least-squares fit", use_container_width=True, disabled=window.empty):
         from .fitting import fit_limb_darkened_single_transit
 
@@ -2749,6 +3920,9 @@ def _render_single_transit_fit_subtab() -> None:
             **result.params,
         }
         st.session_state["phot_fit_single_transit_ls_result"] = fit
+        all_results = st.session_state.setdefault("phot_fit_single_transit_ls_results_by_planet", {})
+        all_results[str(planet_name)] = fit
+        st.session_state["phot_fit_single_transit_ls_results_by_planet"] = all_results
         st.success("Single-transit least-squares fit saved for the per-transit T0 page.")
 
     latest = st.session_state.get("phot_fit_single_transit_ls_result")
@@ -2759,6 +3933,9 @@ def _render_single_transit_fit_subtab() -> None:
         st.dataframe(fit_table, use_container_width=True, hide_index=True)
         fit_window = data.loc[(data["time"] >= float(latest["start"])) & (data["time"] <= float(latest["end"]))].copy()
         if not fit_window.empty:
+            fit_plot_data, fit_stride = _single_transit_plot_frame(fit_window)
+            if fit_stride > 1:
+                st.info(f"{_stride_note(len(fit_window), len(fit_plot_data), fit_stride)} The single-transit fit used all {len(fit_window):,} selected points.")
             st.plotly_chart(
                 _single_transit_fit_figure(fit_window, latest),
                 width="stretch",
@@ -2766,57 +3943,67 @@ def _render_single_transit_fit_subtab() -> None:
                 config={"displaylogo": False, "scrollZoom": True},
             )
 
+    all_results = st.session_state.get("phot_fit_single_transit_ls_results_by_planet", {})
+    if isinstance(all_results, dict) and all_results:
+        st.subheader("Single-transit LS fit outputs by planet")
+        output_lines = []
+        host_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", _target_name_for_exofop_lookup() or "target").strip("_") or "target"
+        for planet, fit in sorted(all_results.items()):
+            st.caption(f"Planet {planet}")
+            fit_table = pd.DataFrame(
+                [{"planet": planet, "parameter": key, "value": value} for key, value in fit.items() if isinstance(value, (int, float, np.floating))]
+            )
+            st.dataframe(fit_table, use_container_width=True, hide_index=True)
+            source_data_for_fit = sources.get(str(fit.get("source", "")), data)
+            fit_subsets = _single_transit_subset_options(source_data_for_fit)
+            fit_data = fit_subsets.get(str(fit.get("subset", "")), source_data_for_fit)
+            fit_window = fit_data.loc[(fit_data["time"] >= float(fit["start"])) & (fit_data["time"] <= float(fit["end"]))].copy()
+            if not fit_window.empty:
+                fit_plot_data, fit_stride = _single_transit_plot_frame(fit_window)
+                if fit_stride > 1:
+                    st.info(f"{_stride_note(len(fit_window), len(fit_plot_data), fit_stride)} The single-transit fit used all {len(fit_window):,} selected points.")
+                st.plotly_chart(
+                    _single_transit_fit_figure(fit_window, fit),
+                    width="stretch",
+                    key=f"single_transit_fit_overlay_{planet}",
+                    config={"displaylogo": False, "scrollZoom": True},
+                )
+            output_lines.append(f"[planet {planet}]")
+            for key, value in fit.items():
+                output_lines.append(f"{key}: {value}")
+            output_lines.append("")
+        st.download_button(
+            "Download single-transit planet parameters",
+            data="\n".join(output_lines).encode("utf-8"),
+            file_name=f"{host_name}_single_transit_planet_parameters.txt",
+            mime="text/plain",
+            use_container_width=True,
+            key="download_single_transit_planet_parameters",
+        )
+
 
 def render_import_workflows() -> None:
-    photometry_import, rv_import, _photometry_fit = import_allesfitter_pages()
+    photometry_import, _rv_import, _photometry_fit = import_allesfitter_pages()
     from app import mast  # type: ignore
 
-    phot_tab, rv_tab, simple_tab = st.tabs(["Photometry Import", "RV Import", "Simple Table Import"])
-    with phot_tab:
-        filter_existing_mast_result(mast)
-        photometry_import.render()
-        if st.session_state.get("mast_product_warning"):
-            st.warning(st.session_state["mast_product_warning"])
-        bridge_prepared_photometry()
-        if not st.session_state.get("photometry", pd.DataFrame()).empty:
-            st.success("Prepared photometry is available to the TTV and physical model tabs.")
-    with rv_tab:
-        rv_import.render()
-    with simple_tab:
-        st.subheader("Simple table bridge")
-        st.caption("Use this only when you already have reduced CSV/TSV tables and want to feed the later TTV/RV tabs directly.")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            phot = st.file_uploader("Photometry table", type=["csv", "tsv", "txt", "dat"], key="simple_phot_upload")
-            if phot is not None:
-                st.session_state["photometry"] = normalize_photometry(read_table(phot))
-                st.success(f"Loaded {len(st.session_state['photometry'])} photometry rows.")
-            timing = st.file_uploader("Transit timings table", type=["csv", "tsv", "txt", "dat"], key="simple_timing_upload")
-            if timing is not None:
-                st.session_state["timings"] = normalize_timings(read_table(timing))
-                st.success(f"Loaded {len(st.session_state['timings'])} timing rows.")
-        with col_b:
-            rv = st.file_uploader("RV table", type=["csv", "tsv", "txt", "dat"], key="simple_rv_upload")
-            if rv is not None:
-                st.session_state["rv"] = normalize_rv(read_table(rv))
-                st.success(f"Loaded {len(st.session_state['rv'])} RV rows.")
-            params = st.file_uploader("allesfitter params.csv", type=["csv"], key="simple_params_upload")
-            if params is not None:
-                imported = parse_allesfitter_params(read_table(params))
-                if not imported.empty:
-                    st.session_state["planets"] = coerce_planet_table(imported)
-                    st.success(f"Imported {len(st.session_state['planets'])} planet row(s).")
+    filter_existing_mast_result(mast)
+    photometry_import.render()
+    if st.session_state.get("mast_product_warning"):
+        st.warning(st.session_state["mast_product_warning"])
+    bridge_prepared_photometry()
+    if not st.session_state.get("photometry", pd.DataFrame()).empty:
+        st.success("Prepared photometry is available to the TTV and physical model tabs.")
 
 
 def render_linear_transit_workflow() -> None:
     _photometry_import, _rv_import, photometry_fit = import_allesfitter_pages()
-    st.subheader("Photometry Transit Fit")
+    st.subheader("Linear Transit Fit")
+    _render_linear_fit_data_loader(photometry_fit)
+    st.divider()
+    photometry_fit._render_exofop_retrieval()
+    st.divider()
     linear_tab, single_tab = st.tabs(["Linear fit", "Fit one transit"])
     with linear_tab:
-        photometry_fit._render_data_loader()
-        st.divider()
-        photometry_fit._render_exofop_retrieval()
-        st.divider()
         photometry_fit._render_transit_parameter_setup()
     with single_tab:
         _render_single_transit_fit_subtab()

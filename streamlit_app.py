@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from io import BytesIO
 from pathlib import Path
 
@@ -13,7 +14,13 @@ import pandas as pd
 import streamlit as st
 
 from ttv_fitter.dynamics import compare_model_to_timings, rebound_available, run_physical_ttv_model
-from ttv_fitter.alles_workflows import render_import_workflows, render_linear_transit_workflow
+from ttv_fitter.alles_workflows import (
+    _clean_fit_sector_table,
+    _default_sector_directory,
+    _sector_tables_from_directory,
+    render_import_workflows,
+    render_linear_transit_workflow,
+)
 from ttv_fitter.fitting import (
     build_cutouts,
     fit_cutout_t0,
@@ -189,7 +196,10 @@ def _instrument_suffix(values: dict[str, float]) -> str:
 
 def _linear_fit_parameter_set(planet_name: str, source_kind: str) -> tuple[dict[str, float], str]:
     if source_kind == "single_ls":
-        fit = st.session_state.get("phot_fit_single_transit_ls_result")
+        all_fits = st.session_state.get("phot_fit_single_transit_ls_results_by_planet", {})
+        fit = all_fits.get(str(planet_name)) if isinstance(all_fits, dict) else None
+        if fit is None:
+            fit = st.session_state.get("phot_fit_single_transit_ls_result")
         if not isinstance(fit, dict) or not fit:
             return {}, ""
         if str(fit.get("planet", planet_name)) != str(planet_name):
@@ -491,6 +501,81 @@ def _populate_cutout_parameter_controls(planet_name: str, values: dict[str, floa
             st.session_state["planets"] = coerce_planet_table(planets)
 
 
+def _planet_row_cutout_values(row: pd.Series | dict) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for source, target in [
+        ("t0", "t0"),
+        ("period", "period"),
+        ("radius_ratio", "radius_ratio"),
+        ("impact", "impact"),
+        ("a_over_rstar", "a_over_rstar"),
+        ("duration_hours", "duration_hours"),
+    ]:
+        try:
+            value = float(row.get(source, np.nan))
+        except (TypeError, ValueError):
+            value = np.nan
+        if np.isfinite(value):
+            values[target] = value
+    values.setdefault("limb_darkening_u1", 0.5)
+    values.setdefault("limb_darkening_u2", 0.1)
+    values.setdefault("baseline_offset", 0.0)
+    return values
+
+
+def _parse_single_transit_parameter_text(text: str) -> dict[str, dict[str, float]]:
+    planets: dict[str, dict[str, float]] = {}
+    current: str | None = None
+    for raw_line in str(text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.fullmatch(r"\[planet\s+(.+?)\]", line, flags=re.IGNORECASE)
+        if match:
+            current = match.group(1).strip()
+            planets.setdefault(current, {})
+            continue
+        if current is None or ":" not in line:
+            continue
+        key, value_text = line.split(":", 1)
+        key = key.strip()
+        try:
+            value = float(value_text.strip())
+        except ValueError:
+            continue
+        if np.isfinite(value):
+            planets.setdefault(current, {})[key] = value
+    return planets
+
+
+def _update_planets_from_single_transit_file(parsed: dict[str, dict[str, float]]) -> None:
+    if not parsed:
+        return
+    planets = coerce_planet_table(st.session_state.get("planets"))
+    rows = planets.to_dict("records")
+    by_name = {str(row.get("name", "")): index for index, row in enumerate(rows)}
+    for planet_name, values in parsed.items():
+        if not values:
+            continue
+        if planet_name in by_name:
+            row = rows[by_name[planet_name]]
+        else:
+            row = PlanetParams(name=planet_name).to_row()
+            rows.append(row)
+            by_name[planet_name] = len(rows) - 1
+        for key in ["t0", "period", "radius_ratio", "impact", "duration_hours", "a_over_rstar"]:
+            value = values.get(key)
+            if value is not None and np.isfinite(float(value)):
+                row[key] = float(value)
+    st.session_state["planets"] = coerce_planet_table(pd.DataFrame(rows))
+    existing = st.session_state.get("phot_fit_single_transit_ls_results_by_planet", {})
+    if not isinstance(existing, dict):
+        existing = {}
+    for planet_name, values in parsed.items():
+        existing[str(planet_name)] = {"planet": str(planet_name), **values}
+    st.session_state["phot_fit_single_transit_ls_results_by_planet"] = existing
+
+
 def _align_t0_to_photometry_time(t0: float, photometry: pd.DataFrame) -> float:
     if photometry.empty or "time" not in photometry:
         return float(t0)
@@ -504,28 +589,74 @@ def _align_t0_to_photometry_time(t0: float, photometry: pd.DataFrame) -> float:
     return float(t0)
 
 
+def _load_cutout_sector_tables(tables: dict[str, pd.DataFrame], source: str) -> bool:
+    cleaned = []
+    for key, table in tables.items():
+        if not isinstance(table, pd.DataFrame) or table.empty:
+            continue
+        data = _clean_fit_sector_table(table, str(key))
+        if "is_outlier" in data:
+            data = data.loc[~data["is_outlier"].astype(bool)].copy()
+        if not data.empty:
+            cleaned.append(data)
+    if not cleaned:
+        return False
+    photometry = pd.concat(cleaned, ignore_index=True).sort_values("time").reset_index(drop=True)
+    st.session_state.photometry = normalize_photometry(photometry)
+    st.session_state["cutout_photometry_source"] = source
+    return True
+
+
 def _load_cutout_photometry_controls() -> None:
     fit_data = st.session_state.get("photometry_fit_data")
+    fit_sector_data = st.session_state.get("photometry_fit_sector_data")
     prepared = st.session_state.get("prepared_photometry")
-    cols = st.columns(2)
+    prepared_sectors = st.session_state.get("prepared_sector_photometry")
+    cols = st.columns(3)
     with cols[0]:
         if isinstance(fit_data, pd.DataFrame) and not fit_data.empty:
             if st.button("Load photometry from Linear Transit Fit page", use_container_width=True):
                 st.session_state.photometry = normalize_photometry(fit_data)
+                st.session_state["cutout_photometry_source"] = "Linear Transit Fit page"
                 st.success(f"Loaded {len(st.session_state.photometry):,} photometry points from the Linear Transit Fit page.")
                 st.rerun()
         elif isinstance(prepared, pd.DataFrame) and not prepared.empty:
             if st.button("Load prepared photometry", use_container_width=True):
                 export = prepared.loc[~prepared.get("is_outlier", False)].copy() if "is_outlier" in prepared else prepared.copy()
                 st.session_state.photometry = normalize_photometry(export)
+                st.session_state["cutout_photometry_source"] = "prepared stitched photometry"
                 st.success(f"Loaded {len(st.session_state.photometry):,} prepared photometry points.")
                 st.rerun()
     with cols[1]:
-        upload = st.file_uploader("Upload photometry for cutouts", type=["csv", "tsv", "txt", "dat"], key="cutout_phot_upload")
-        if upload is not None:
-            st.session_state.photometry = normalize_photometry(read_table(upload))
-            st.success(f"Loaded {len(st.session_state.photometry):,} uploaded photometry points.")
-            st.rerun()
+        if isinstance(fit_sector_data, dict) and fit_sector_data:
+            if st.button("Load sector data from Linear Transit Fit page", use_container_width=True):
+                if _load_cutout_sector_tables(fit_sector_data, "Linear Transit Fit sector data"):
+                    st.success(f"Loaded {len(st.session_state.photometry):,} photometry points from Linear Transit Fit sectors.")
+                    st.rerun()
+                st.warning("No usable sector data was found on the Linear Transit Fit page.")
+        elif isinstance(prepared_sectors, dict) and prepared_sectors:
+            if st.button("Load sector data from data preparation", use_container_width=True):
+                if _load_cutout_sector_tables(prepared_sectors, "TTV data preparation sector data"):
+                    st.success(f"Loaded {len(st.session_state.photometry):,} photometry points from prepared sectors.")
+                    st.rerun()
+                st.warning("No usable prepared sector data was found.")
+        else:
+            st.button("Load sector data", use_container_width=True, disabled=True)
+            st.info("No sector data has been loaded or prepared yet.")
+    with cols[2]:
+        directory = st.text_input("Sector directory", value=_default_sector_directory(), key="cutout_sector_directory")
+        if st.button("Load sector directory for cutouts", use_container_width=True):
+            tables = _sector_tables_from_directory(directory)
+            if _load_cutout_sector_tables(tables, f"Sector directory: {directory}"):
+                st.success(f"Loaded {len(st.session_state.photometry):,} photometry points from {len(tables)} sector file(s).")
+                st.rerun()
+            st.warning("No usable sector CSV files were found in that directory.")
+    upload = st.file_uploader("Upload photometry for cutouts", type=["csv", "tsv", "txt", "dat"], key="cutout_phot_upload")
+    if upload is not None:
+        st.session_state.photometry = normalize_photometry(read_table(upload))
+        st.session_state["cutout_photometry_source"] = upload.name
+        st.success(f"Loaded {len(st.session_state.photometry):,} uploaded photometry points.")
+        st.rerun()
 
 
 def _render_selected_cutout_fit(planet_name: str) -> None:
@@ -728,6 +859,13 @@ def _oc_png_bytes(timings: pd.DataFrame, t0: float, period: float) -> bytes:
 def per_transit_tab() -> None:
     st.subheader("Per-Transit T0 Fit")
     st.caption("Build transit cutouts from a linear ephemeris and refit only each midpoint.")
+    with st.expander("Load photometry for per-transit cutouts", expanded=st.session_state.photometry.empty):
+        _load_cutout_photometry_controls()
+        source = st.session_state.get("cutout_photometry_source")
+        if not st.session_state.photometry.empty:
+            suffix = f" from {source}" if source else ""
+            st.caption(f"Current cutout photometry: {len(st.session_state.photometry):,} point(s){suffix}.")
+
     planets = coerce_planet_table(st.session_state.planets)
     selected_name = st.selectbox(
         "Planet",
@@ -757,32 +895,41 @@ def per_transit_tab() -> None:
     aligned_t0 = _align_t0_to_photometry_time(float(st.session_state[t0_key]), st.session_state.photometry)
     if aligned_t0 != float(st.session_state[t0_key]):
         st.session_state[t0_key] = aligned_t0
-    pull_cols = st.columns(3)
+    pull_cols = st.columns(4)
     with pull_cols[0]:
+        if st.button("Load current planet-table parameters", use_container_width=True):
+            values = _planet_row_cutout_values(row)
+            if not values:
+                st.warning("No usable parameters were found for the selected planet.")
+            else:
+                _populate_cutout_parameter_controls(selected_name, values)
+                st.success("Loaded T0, period, and transit-shape start values from the current planet table.")
+                st.rerun()
+    with pull_cols[1]:
         if st.button(
             "Pull latest MCMC median Linear T0 parameters from the Linear Transit Fit page",
             use_container_width=True,
         ):
             values, source = _linear_fit_parameter_set(selected_name, "mcmc")
             if not values:
-                st.warning("No Linear Transit Fit MCMC chain was found yet. Run MCMC on the Linear Transit/RV Fit page first.")
+                st.warning("No Linear Transit Fit MCMC chain was found yet. Run MCMC on the Linear Transit Fit page first.")
             else:
                 _populate_cutout_parameter_controls(selected_name, values)
                 st.success(f"Pulled fitted transit-shape parameters from {source}.")
                 st.rerun()
-    with pull_cols[1]:
+    with pull_cols[2]:
         if st.button(
             "Pull latest LS fit Linear T0 parameters from the Linear Transit Fit page",
             use_container_width=True,
         ):
             values, source = _linear_fit_parameter_set(selected_name, "ls")
             if not values:
-                st.warning("No Linear Transit Fit parameter table was found yet. Run or generate parameters on the Linear Transit/RV Fit page first.")
+                st.warning("No Linear Transit Fit parameter table was found yet. Run or generate parameters on the Linear Transit Fit page first.")
             else:
                 _populate_cutout_parameter_controls(selected_name, values)
                 st.success(f"Pulled fitted transit-shape parameters from {source}.")
                 st.rerun()
-    with pull_cols[2]:
+    with pull_cols[3]:
         if st.button(
             "Pull latest Single transit LS fit parameters from the Linear Transit Fit page",
             use_container_width=True,
@@ -794,6 +941,28 @@ def per_transit_tab() -> None:
                 _populate_cutout_parameter_controls(selected_name, values)
                 st.success(f"Pulled fitted transit-shape parameters from {source}.")
                 st.rerun()
+    uploaded_single_transit_params = st.file_uploader(
+        "Or load single-transit planet parameters file",
+        type=["txt"],
+        key="cutout_single_transit_parameter_upload",
+        help="Reads the text file downloaded from Linear Transit Fit > Fit one transit, with [planet b] sections.",
+    )
+    if uploaded_single_transit_params is not None:
+        try:
+            parsed_params = _parse_single_transit_parameter_text(uploaded_single_transit_params.getvalue().decode("utf-8"))
+        except UnicodeDecodeError:
+            parsed_params = {}
+        if not parsed_params:
+            st.warning("No planet parameter blocks were found in that file.")
+        elif st.button("Load uploaded single-transit parameters", use_container_width=True):
+            _update_planets_from_single_transit_file(parsed_params)
+            selected_values = parsed_params.get(str(selected_name), {})
+            if selected_values:
+                _populate_cutout_parameter_controls(selected_name, selected_values)
+                st.success(f"Loaded parameters for planet {selected_name} and updated {len(parsed_params)} planet block(s) from the file.")
+            else:
+                st.success(f"Updated {len(parsed_params)} planet block(s) from the file. Select one of those planets to load its cutout controls.")
+            st.rerun()
     c1, c2, c3 = st.columns(3)
     t0 = c1.number_input(
         "Linear T0",
@@ -866,7 +1035,6 @@ def per_transit_tab() -> None:
     cutouts = build_cutouts(st.session_state.photometry, t0, period, half_width)
     if cutouts.empty:
         st.info("Load photometry to build cutouts.")
-        _load_cutout_photometry_controls()
         return
     edited = st.data_editor(cutouts, use_container_width=True, key="cutout_editor", column_config={"fit": st.column_config.CheckboxColumn("fit")})
     search_half_width = st.number_input(
@@ -875,6 +1043,12 @@ def per_transit_tab() -> None:
         min_value=1e-5,
         format="%.5f",
         help="Allowed midpoint shift during each individual T0 fit. Keep this smaller than the cutout half-width.",
+    )
+    use_ls_multistart = st.checkbox(
+        "Run multiple LS fits with a range of T0 offset startpoints - will take longer to run LS fits",
+        value=bool(st.session_state.get("cutout_ls_multistart", False)),
+        key="cutout_ls_multistart",
+        help="Tiles the T0 search range by roughly one transit duration, up to 10 starts, and keeps the lowest-residual LS solution.",
     )
     if st.button("Fit selected cutout midpoints", use_container_width=True):
         results = []
@@ -894,6 +1068,7 @@ def per_transit_tab() -> None:
                 limb_darkening_u2,
                 baseline_offset,
                 search_half_width,
+                use_t0_multistart=use_ls_multistart,
             )
             if result.success:
                 results.append(
@@ -923,6 +1098,8 @@ def per_transit_tab() -> None:
                         "limb_darkening_u1": float(limb_darkening_u1),
                         "limb_darkening_u2": float(limb_darkening_u2),
                         "duration_hours": float(row["duration_hours"]),
+                        "residual_sum_squares": result.params.get("residual_sum_squares", np.nan),
+                        "n_t0_startpoints": result.params.get("n_t0_startpoints", 1.0),
                     }
                 )
         st.session_state.timings = pd.DataFrame(results)
@@ -939,6 +1116,58 @@ def per_transit_tab() -> None:
     if not current_timings.empty:
         st.dataframe(current_timings, use_container_width=True)
         st.download_button("Download timing table", current_timings.to_csv(index=False), "ttv_timings.csv", "text/csv")
+    st.markdown("**T0 MCMC tuning**")
+    mcmc_cols = st.columns(4)
+    mcmc_search_half_width = mcmc_cols[0].number_input(
+        "MCMC T0 search half-width [days]",
+        min_value=1e-5,
+        value=float(st.session_state.get("cutout_mcmc_search_half_width_days", 1.5 / 24.0)),
+        step=0.01,
+        format="%.5f",
+        key="cutout_mcmc_search_half_width_days",
+        help="Each one-parameter MCMC samples T0 uniformly within the LS midpoint plus or minus this value.",
+    )
+    mcmc_walkers = int(
+        mcmc_cols[1].number_input(
+            "MCMC walkers",
+            min_value=2,
+            value=int(st.session_state.get("cutout_mcmc_walkers", 6)),
+            step=1,
+            key="cutout_mcmc_walkers",
+        )
+    )
+    mcmc_steps = int(
+        mcmc_cols[2].number_input(
+            "MCMC steps",
+            min_value=2,
+            value=int(st.session_state.get("cutout_mcmc_steps", 1000)),
+            step=100,
+            key="cutout_mcmc_steps",
+        )
+    )
+    mcmc_burn = int(
+        mcmc_cols[3].number_input(
+            "MCMC burn-in steps",
+            min_value=0,
+            value=min(int(st.session_state.get("cutout_mcmc_burn", 500)), max(mcmc_steps - 1, 0)),
+            step=50,
+            key="cutout_mcmc_burn",
+        )
+    )
+    mcmc_burn = min(mcmc_burn, max(mcmc_steps - 1, 0))
+    trim_mcmc_walkers = st.checkbox(
+        "Trim non-converged MCMC walkers before calculating T0 uncertainties",
+        value=bool(st.session_state.get("cutout_mcmc_trim_walkers", True)),
+        key="cutout_mcmc_trim_walkers",
+        help=(
+            "After burn-in, exclude whole walkers whose T0 median is clearly separated from the dominant posterior cluster. "
+            "If trimming would leave too few walkers, the full chain is kept."
+        ),
+    )
+    st.caption(
+        "Walkers are initialized across the full T0 search range. For missed transits, broaden the search half-width first, "
+        "then increase walkers or steps if the histogram remains broad or multi-peaked."
+    )
     if st.button("Prepare MCMC fits for each transit", use_container_width=True):
         details = st.session_state.get("cutout_fit_details", pd.DataFrame())
         if not isinstance(details, pd.DataFrame) or details.empty:
@@ -964,10 +1193,11 @@ def per_transit_tab() -> None:
                         float(fit["limb_darkening_u1"]),
                         float(fit["limb_darkening_u2"]),
                         float(fit["baseline_offset"]),
-                        search_half_width_days=1.5 / 24.0,
-                        nwalkers=6,
-                        nsteps=1000,
-                        burn=500,
+                        search_half_width_days=mcmc_search_half_width,
+                        nwalkers=mcmc_walkers,
+                        nsteps=mcmc_steps,
+                        burn=mcmc_burn,
+                        trim_nonconverged_walkers=trim_mcmc_walkers,
                     )
                     if result.success:
                         epoch = int(fit["epoch"])
@@ -981,6 +1211,8 @@ def per_transit_tab() -> None:
                             "tmid_err_plus": result.params["tmid_err_plus"],
                             "expected_tmid": fit["expected_tmid"],
                             "points": int(fit["points"]),
+                            "nwalkers_used": result.params.get("nwalkers_used", np.nan),
+                            "nwalkers_trimmed": result.params.get("nwalkers_trimmed", np.nan),
                         }
                         mcmc_rows.append(row)
                         detail = dict(fit)
@@ -1276,8 +1508,8 @@ def main() -> None:
     st.caption("Transit timing variation fitting, linear transit/RV fits, and 3D multiplanet rendering.")
     tabs = st.tabs(
         [
-            "Data Import",
-            "Linear Transit/RV Fit",
+            "TTV data preparation workflow",
+            "Linear Transit Fit",
             "Per-Transit T0 Fit",
             "TTV Model",
             "3D System Model",

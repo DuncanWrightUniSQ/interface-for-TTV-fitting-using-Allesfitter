@@ -8,7 +8,13 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
 
-from .models import PlanetParams, limb_darkened_transit_model, phase_fold, rv_model, trapezoid_transit_model
+from .models import (
+    PlanetParams,
+    limb_darkened_transit_model,
+    phase_fold,
+    rv_model,
+    trapezoid_transit_model,
+)
 
 
 @dataclass
@@ -61,6 +67,8 @@ def fit_limb_darkened_single_transit(
     free = [name for name in fit_parameters if name in start]
     if "t0" not in free:
         free.insert(0, "t0")
+    if "duration_hours" in free and np.isfinite(float(start.get("a_over_rstar", np.nan))):
+        free.remove("duration_hours")
 
     defaults = {
         "t0": float(np.nanmedian(time)),
@@ -75,28 +83,38 @@ def fit_limb_darkened_single_transit(
     }
     values = {key: float(start.get(key, default)) for key, default in defaults.items()}
     span = max(float(np.nanmax(time) - np.nanmin(time)), 1e-5)
+    duration_seed_days = max(values["duration_hours"] / 24.0, 1e-5)
+    t0_half_width = min(0.45 * span, max(3.0 * duration_seed_days, 0.15))
+    t0_center = float(np.clip(values["t0"], np.nanmin(time), np.nanmax(time)))
+    radius_seed = float(np.clip(values["radius_ratio"], 1e-5, 1.0))
+    duration_upper_hours = max(0.05, min(span * 24.0 * 0.6, max(values["duration_hours"] * 2.0, values["duration_hours"] + 1.0)))
     lower_map = {
-        "t0": float(np.nanmin(time) - 0.2 * span),
+        "t0": max(float(np.nanmin(time)), t0_center - t0_half_width),
         "period": 1e-6,
-        "radius_ratio": 1e-5,
+        "radius_ratio": max(1e-4, radius_seed * 0.25),
         "impact": 0.0,
-        "duration_hours": 0.02,
-        "a_over_rstar": 1.0001,
-        "limb_darkening_u1": -1.0,
-        "limb_darkening_u2": -1.0,
+        "duration_hours": max(0.02, values["duration_hours"] * 0.4),
+        "a_over_rstar": max(1.0001, values["a_over_rstar"] * 0.25),
+        "limb_darkening_u1": max(-1.0, values["limb_darkening_u1"] - 0.5),
+        "limb_darkening_u2": max(-1.0, values["limb_darkening_u2"] - 0.5),
         "baseline_offset": -0.5,
     }
     upper_map = {
-        "t0": float(np.nanmax(time) + 0.2 * span),
+        "t0": min(float(np.nanmax(time)), t0_center + t0_half_width),
         "period": 1e5,
-        "radius_ratio": 1.0,
-        "impact": 2.0,
-        "duration_hours": max(48.0, span * 24.0),
-        "a_over_rstar": 1e4,
-        "limb_darkening_u1": 1.0,
-        "limb_darkening_u2": 1.0,
+        "radius_ratio": min(1.0, max(radius_seed * 3.0, radius_seed + 0.05)),
+        "impact": min(2.0, 1.0 + min(1.0, max(radius_seed * 3.0, radius_seed + 0.05))),
+        "duration_hours": duration_upper_hours,
+        "a_over_rstar": max(values["a_over_rstar"] * 3.0, values["a_over_rstar"] + 5.0, 1.0002),
+        "limb_darkening_u1": min(1.0, values["limb_darkening_u1"] + 0.5),
+        "limb_darkening_u2": min(1.0, values["limb_darkening_u2"] + 0.5),
         "baseline_offset": 0.5,
     }
+    if upper_map["t0"] <= lower_map["t0"]:
+        lower_map["t0"] = float(np.nanmin(time))
+        upper_map["t0"] = float(np.nanmax(time))
+    if upper_map["duration_hours"] <= lower_map["duration_hours"]:
+        upper_map["duration_hours"] = lower_map["duration_hours"] + 0.05
     x0 = np.array([np.clip(values[name], lower_map[name], upper_map[name]) for name in free], dtype=float)
     lower = np.array([lower_map[name] for name in free], dtype=float)
     upper = np.array([upper_map[name] for name in free], dtype=float)
@@ -166,13 +184,13 @@ def fit_cutout_t0(
     limb_darkening_u2: float,
     baseline_offset: float,
     search_half_width_days: float,
+    use_t0_multistart: bool = False,
 ) -> FitResult:
     if phot.empty or not {"time", "flux"}.issubset(phot.columns):
         return FitResult({}, False, "Cutout needs time and flux columns.")
     time = phot["time"].to_numpy(dtype=float)
     flux = phot["flux"].to_numpy(dtype=float)
     err = _sigma(phot.get("flux_err", pd.Series(np.full(len(phot), 1e-3))), 1e-3)
-    x0 = np.array([expected_t0, baseline_offset])
     lower = np.array([expected_t0 - search_half_width_days, -0.5])
     upper = np.array([expected_t0 + search_half_width_days, 0.5])
 
@@ -191,12 +209,105 @@ def fit_cutout_t0(
         )
         return (flux - model) / err
 
-    result = least_squares(residual, x0, bounds=(lower, upper), max_nfev=1200)
+    if use_t0_multistart:
+        duration_days = max(float(duration_hours) / 24.0, 1e-8)
+        total_window_days = max(float(search_half_width_days) * 2.0, 0.0)
+        n_starts = int(np.clip(np.ceil((total_window_days / duration_days) - 1e-9), 1, 10))
+        if n_starts > 1:
+            start_lower = lower[0] + 0.5 * duration_days
+            start_upper = upper[0] - 0.5 * duration_days
+            if start_upper > start_lower:
+                t0_starts = np.linspace(start_lower, start_upper, n_starts)
+            else:
+                t0_starts = np.linspace(lower[0], upper[0], n_starts)
+        else:
+            t0_starts = np.array([expected_t0], dtype=float)
+    else:
+        t0_starts = np.array([expected_t0], dtype=float)
+
+    best_result = None
+    best_score = np.inf
+    for t0_start in t0_starts:
+        x0 = np.array([float(np.clip(t0_start, lower[0], upper[0])), baseline_offset], dtype=float)
+        result = least_squares(residual, x0, bounds=(lower, upper), max_nfev=1200)
+        score = float(np.sum(residual(result.x) ** 2))
+        if np.isfinite(score) and score < best_score:
+            best_result = result
+            best_score = score
+
+    if best_result is None:
+        return FitResult({}, False, "No finite least-squares solution was found.")
+    result = best_result
     return FitResult(
-        {"tmid": float(result.x[0]), "baseline_offset": float(result.x[1]), "baseline": float(1.0 + result.x[1])},
+        {
+            "tmid": float(result.x[0]),
+            "baseline_offset": float(result.x[1]),
+            "baseline": float(1.0 + result.x[1]),
+            "residual_sum_squares": float(best_score),
+            "n_t0_startpoints": float(len(t0_starts)),
+        },
         bool(result.success),
         result.message,
     )
+
+
+def _post_burn_t0_chain_by_walker(chain: np.ndarray, nwalkers: int) -> np.ndarray:
+    arr = np.asarray(chain, dtype=float)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        return np.empty((0, 0), dtype=float)
+    if arr.shape[1] == nwalkers:
+        return arr
+    if arr.shape[0] == nwalkers:
+        return arr.T
+    return arr
+
+
+def _trim_nonconverged_t0_walkers(
+    chain_by_step_walker: np.ndarray,
+    duration_hours: float,
+    enabled: bool,
+) -> tuple[np.ndarray, int, int, bool, float]:
+    chain = np.asarray(chain_by_step_walker, dtype=float)
+    if chain.ndim != 2 or chain.size == 0:
+        return np.array([], dtype=float), 0, 0, False, np.nan
+
+    finite_by_walker = np.any(np.isfinite(chain), axis=0)
+    if not np.any(finite_by_walker):
+        return np.array([], dtype=float), 0, 0, False, np.nan
+
+    active_chain = chain[:, finite_by_walker]
+    full_flat = active_chain.reshape(-1)
+    full_flat = full_flat[np.isfinite(full_flat)]
+    total_walkers = int(active_chain.shape[1])
+    if not enabled or total_walkers < 3 or full_flat.size == 0:
+        return full_flat, total_walkers, total_walkers, False, np.nan
+
+    walker_medians = np.nanmedian(active_chain, axis=0)
+    finite_medians = np.isfinite(walker_medians)
+    if int(np.sum(finite_medians)) < 3:
+        return full_flat, total_walkers, total_walkers, False, np.nan
+
+    center = float(np.nanmedian(full_flat))
+    mad = float(np.nanmedian(np.abs(full_flat - center)))
+    robust_sigma = 1.4826 * mad if np.isfinite(mad) else 0.0
+    duration_days = max(float(duration_hours) / 24.0, 1e-8)
+    threshold = max(5.0 * robust_sigma, 0.05 * duration_days, 1e-8)
+    keep = finite_medians & (np.abs(walker_medians - center) <= threshold)
+
+    min_keep = max(2, int(np.ceil(0.5 * total_walkers)))
+    if int(np.sum(keep)) < min_keep:
+        return full_flat, total_walkers, total_walkers, False, threshold
+
+    trimmed = active_chain[:, keep].reshape(-1)
+    trimmed = trimmed[np.isfinite(trimmed)]
+    if trimmed.size == 0:
+        return full_flat, total_walkers, total_walkers, False, threshold
+    used_walkers = int(np.sum(keep))
+    return trimmed, total_walkers, used_walkers, used_walkers < total_walkers, threshold
 
 
 def run_cutout_t0_mcmc(
@@ -214,6 +325,7 @@ def run_cutout_t0_mcmc(
     nwalkers: int = 6,
     nsteps: int = 1000,
     burn: int = 500,
+    trim_nonconverged_walkers: bool = True,
 ) -> FitResult:
     try:
         import emcee
@@ -247,14 +359,36 @@ def run_cutout_t0_mcmc(
         chi = (flux - model) / err
         return -0.5 * float(np.sum(chi**2))
 
-    rng = np.random.default_rng(42)
     nwalkers = max(int(nwalkers), 2)
     nsteps = max(int(nsteps), 2)
     burn = min(max(int(burn), 0), nsteps - 1)
-    p0 = rng.uniform(lower, upper, size=(nwalkers, 1))
+    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+        return FitResult({}, False, "MCMC T0 search range is invalid.")
+
+    rng = np.random.default_rng(42)
+    span = upper - lower
+    centers = np.linspace(lower, upper, nwalkers + 2, dtype=float)[1:-1]
+    jitter_scale = 0.2 * span / max(nwalkers + 1, 1)
+    p0_values = centers + rng.uniform(-jitter_scale, jitter_scale, size=nwalkers)
+    p0 = np.clip(p0_values, lower + span * 1e-9, upper - span * 1e-9).reshape(nwalkers, 1)
     sampler = emcee.EnsembleSampler(nwalkers, 1, log_prob)
     sampler.run_mcmc(p0, nsteps, progress=False)
-    flat = sampler.get_chain(discard=burn, flat=True)[:, 0]
+    chain = _post_burn_t0_chain_by_walker(sampler.get_chain(discard=burn, flat=False), nwalkers)
+    flat, total_walkers, used_walkers, trim_applied, trim_threshold = _trim_nonconverged_t0_walkers(
+        chain,
+        duration_hours,
+        trim_nonconverged_walkers,
+    )
+    if flat.size == 0:
+        raw_flat = np.asarray(sampler.get_chain(discard=burn, flat=True), dtype=float)
+        flat = raw_flat[:, 0] if raw_flat.ndim == 2 and raw_flat.shape[1] else raw_flat.reshape(-1)
+        flat = flat[np.isfinite(flat)]
+        total_walkers = nwalkers
+        used_walkers = nwalkers
+        trim_applied = False
+        trim_threshold = np.nan
+    if flat.size == 0:
+        return FitResult({}, False, "MCMC did not produce finite T0 samples.")
     p16, median, p84 = np.nanpercentile(flat, [16, 50, 84])
     samples = pd.DataFrame({"tmid": flat})
     return FitResult(
@@ -266,8 +400,16 @@ def run_cutout_t0_mcmc(
             "prior_lower": lower,
             "prior_upper": upper,
             "nwalkers": float(nwalkers),
+            "nwalkers_total": float(total_walkers),
+            "nwalkers_used": float(used_walkers),
+            "nwalkers_trimmed": float(max(total_walkers - used_walkers, 0)),
             "nsteps": float(nsteps),
             "burn": float(burn),
+            "trim_nonconverged_walkers": float(bool(trim_nonconverged_walkers)),
+            "walker_trim_applied": float(bool(trim_applied)),
+            "walker_trim_threshold_days": float(trim_threshold) if np.isfinite(trim_threshold) else np.nan,
+            "initial_t0_min": float(np.min(p0[:, 0])),
+            "initial_t0_max": float(np.max(p0[:, 0])),
         },
         True,
         "T0-only MCMC complete.",

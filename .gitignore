@@ -6,4 +6,6 @@ __pycache__/
 .streamlit/secrets.toml
 data/uploads/
 data/outputs/
+data/
+.matplotlib/
 conda-allesfitter
