@@ -4,6 +4,12 @@ Version 1.0.0 Streamlit workbench for transit timing variation analysis,
 TESS photometry preparation, per-transit timing fits, and multi-planet system
 rendering.
 
+This project provides an interface for TTV fitting using Allesfitter. It
+builds on and interoperates with Allesfitter workflows originally created by
+Maximilian Guenther <maximilian.guenther@esa.int> and Tansu Daylan
+<tansu@wustl.edu>. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
+third-party attribution.
+
 The v1.0 app has five workflow tabs:
 
 - **TTV data preparation workflow**: Query/load TESS photometry, review sector
@@ -41,3 +47,11 @@ streamlit run streamlit_app.py
 The app is designed to keep working even if optional dependencies such as
 `emcee` are unavailable; those controls will simply disable the optional MCMC
 actions.
+
+## License
+
+This project is released under the MIT License. See [LICENSE](LICENSE).
+
+Allesfitter is also distributed under the MIT License by its original creators,
+Maximilian Guenther and Tansu Daylan; this project includes attribution in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
