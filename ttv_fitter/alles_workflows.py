@@ -1,4 +1,4 @@
-"""Adapters for reusing the richer Allesfitter_work Streamlit workflows."""
+"""Adapters for reusing the vendored Allesfitter-style Streamlit workflows."""
 
 from __future__ import annotations
 
@@ -25,8 +25,10 @@ from .io import normalize_photometry, read_table
 from .models import coerce_planet_table, derive_a_over_rstar, derive_inclination_deg, limb_darkened_transit_model
 
 
-ALLESFITTER_WORK = Path("/Users/u8009283/Documents/Allesfitter_work")
-ALLESFITTER_CONDA = ALLESFITTER_WORK / "conda-allesfitter"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ALLESFITTER_CONDA = PROJECT_ROOT / "conda-allesfitter"
+ALLESFITTER_PYTHON_ENV = "TTV_FITTER_ALLESFITTER_PYTHON"
+ALLESFITTER_LIB_ENV = "TTV_FITTER_ALLESFITTER_LIB"
 PATCHED_MAST_CACHE_VERSION = 9
 
 
@@ -36,17 +38,34 @@ MAST_PRODUCT_TIMEOUT_SECONDS = 20
 
 
 def ensure_allesfitter_workflows_available() -> None:
-    """Make the existing Allesfitter_work package importable from this app."""
+    """Make the vendored workflow helpers importable from this app."""
     os.environ.setdefault("SETUPTOOLS_USE_DISTUTILS", "local")
-    if str(ALLESFITTER_WORK) not in sys.path:
-        sys.path.insert(0, str(ALLESFITTER_WORK))
+    project_root = str(PROJECT_ROOT)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
     Path(".matplotlib").mkdir(exist_ok=True)
-    conda_link = Path("conda-allesfitter")
-    if not conda_link.exists() and ALLESFITTER_CONDA.exists():
-        try:
-            conda_link.symlink_to(ALLESFITTER_CONDA, target_is_directory=True)
-        except OSError:
-            pass
+
+
+def _configured_allesfitter_python() -> Path:
+    configured = os.environ.get(ALLESFITTER_PYTHON_ENV)
+    if configured:
+        path = Path(configured).expanduser()
+        if path.exists():
+            return path
+    for candidate in (ALLESFITTER_CONDA / "bin" / "python", ALLESFITTER_CONDA / "Scripts" / "python.exe"):
+        if candidate.exists():
+            return candidate
+    return Path(sys.executable)
+
+
+def _configured_allesfitter_library_path() -> str | None:
+    configured = os.environ.get(ALLESFITTER_LIB_ENV)
+    if configured:
+        return str(Path(configured).expanduser())
+    for candidate in (ALLESFITTER_CONDA / "lib", ALLESFITTER_CONDA / "Library" / "bin"):
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 def import_allesfitter_pages():
@@ -3010,13 +3029,18 @@ def patch_photometry_fit_sampler_controls(photometry_fit_module) -> None:
         code = f"import numpy as np; np.float=float; np.int=int; import allesfitter; datadir={str(fit_dir)!r}; {initial_guess_call} {call}"
         log_path = fit_dir / ("mcmc_run.log" if sampler == "MCMC" else "nested_sampling_run.log")
         env = os.environ.copy()
-        env["DYLD_LIBRARY_PATH"] = str(Path.cwd() / "conda-allesfitter" / "lib")
-        env["MPLCONFIGDIR"] = str(Path.cwd() / ".matplotlib")
+        library_path = _configured_allesfitter_library_path()
+        if library_path:
+            existing_library_path = env.get("DYLD_LIBRARY_PATH", "")
+            env["DYLD_LIBRARY_PATH"] = (
+                library_path if not existing_library_path else f"{library_path}{os.pathsep}{existing_library_path}"
+            )
+        env["MPLCONFIGDIR"] = str(PROJECT_ROOT / ".matplotlib")
         env["HDF5_USE_FILE_LOCKING"] = "FALSE"
         log_file = log_path.open("w", encoding="utf-8")
         process = subprocess.Popen(
-            [str(Path.cwd() / "conda-allesfitter" / "bin" / "python"), "-c", code],
-            cwd=str(Path.cwd()),
+            [str(_configured_allesfitter_python()), "-c", code],
+            cwd=str(PROJECT_ROOT),
             stdout=log_file,
             stderr=subprocess.STDOUT,
             env=env,

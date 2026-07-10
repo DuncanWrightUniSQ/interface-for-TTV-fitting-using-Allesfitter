@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from ttv_fitter.alles_workflows import (
+    PROJECT_ROOT,
     _available_wotan_method,
     _clean_fit_sector_table,
     _default_sector_directory,
@@ -41,7 +42,7 @@ from ttv_fitter.alles_workflows import (
     _transit_mask_for_ephemerides,
     _wotan_trend_with_method,
 )
-from ttv_fitter.alles_workflows import patch_mast_light_curve_filter
+from ttv_fitter.alles_workflows import ensure_allesfitter_workflows_available, patch_mast_light_curve_filter
 from ttv_fitter.dynamics import compare_model_to_timings, rebound_available, run_physical_ttv_model
 from ttv_fitter.fitting import fit_cutout_t0, fit_limb_darkened_single_transit, run_cutout_t0_mcmc
 from ttv_fitter.models import coerce_planet_table, limb_darkened_transit_model
@@ -86,6 +87,18 @@ class PerTransitFitTests(unittest.TestCase):
         import streamlit_app
 
         self.assertTrue(callable(streamlit_app.cutout_fit_figure))
+
+    def test_vendored_allesfitter_helpers_import_from_repo(self) -> None:
+        ensure_allesfitter_workflows_available()
+
+        import app
+        from app import mast, photometry, plots
+
+        self.assertEqual(Path(app.__file__).resolve().parents[1], PROJECT_ROOT)
+        self.assertTrue(callable(mast.query_tess_photometry))
+        self.assertTrue(callable(photometry.read_photometry_file))
+        self.assertTrue(callable(plots.prepared_photometry_preview))
+        self.assertNotIn("Allesfitter_work", str(PROJECT_ROOT))
 
     def test_least_squares_cutout_fit_does_not_emit_uncertainty(self) -> None:
         result = fit_cutout_t0(
