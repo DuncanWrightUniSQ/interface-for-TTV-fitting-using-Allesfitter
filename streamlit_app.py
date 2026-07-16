@@ -178,16 +178,24 @@ def batch_workflow_tab() -> None:
     photometry_import, _rv_import, photometry_fit = import_allesfitter_pages()
     uploaded = st.file_uploader(
         "Upload target list",
-        type=["txt", "list"],
+        # Do not rely on the browser's extension/MIME filter: macOS and synced
+        # folders can report ordinary .txt files with a non-text MIME type.
+        type=None,
         accept_multiple_files=False,
         key="batch_target_list_upload",
         help="One target name or TIC ID per line. Blank lines and lines beginning with # are ignored.",
     )
     if uploaded is not None:
-        try:
-            text = uploaded.getvalue().decode("utf-8-sig")
-        except UnicodeDecodeError:
-            st.error("The target list must be a UTF-8 text file.")
+        raw = uploaded.getvalue()
+        text = None
+        for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            st.error("Could not decode the target list as plain text (UTF-8, UTF-16, or Windows-1252).")
             return
         targets = parse_target_list(text)
         st.session_state["batch_target_list_text"] = text
