@@ -93,7 +93,10 @@ def estimate_residual_uncertainty(
     scatter = float(np.nanstd(residual, ddof=1))
     if not np.isfinite(scatter) or scatter <= 0:
         return scatter
-    kept = residual[np.abs(residual - center) <= float(sigma_clip) * scatter]
+    # This clipped array exists only inside the scalar uncertainty estimate;
+    # it is never returned or used as fitting photometry.  Reject only
+    # high-side residuals, preserving downward transit-like excursions.
+    kept = residual[(residual - center) <= float(sigma_clip) * scatter]
     return float(np.nanstd(kept, ddof=1)) if kept.size > 1 else scatter
 
 
