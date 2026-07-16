@@ -127,7 +127,14 @@ def _trend_and_flatten(
         adopted_uncertainty = float(uncertainty)
     residual = prepared["flux_before_flatten"].to_numpy(dtype=float) - safe_trend
     scatter = adopted_uncertainty if np.isfinite(adopted_uncertainty) and adopted_uncertainty > 0 else np.nanstd(residual, ddof=1)
-    prepared["is_outlier"] = np.abs(residual - np.nanmedian(residual)) > float(sigma_clip) * scatter if np.isfinite(scatter) and scatter > 0 else False
+    # Do not discard transit dips: they are intentionally negative residuals
+    # and are the signal being fitted.  Match simplified-mode handling by
+    # clipping only high-side excursions, and never points in the transit mask.
+    if np.isfinite(scatter) and scatter > 0:
+        high_side = residual - np.nanmedian(residual) > float(sigma_clip) * scatter
+        prepared["is_outlier"] = high_side & (~np.asarray(transit_mask, dtype=bool) if transit_mask is not None else True)
+    else:
+        prepared["is_outlier"] = False
     prepared["wotan_method"] = "biweight"
     prepared["wotan_cval"] = float(cval)
     prepared["wotan_window_days"] = window_days
