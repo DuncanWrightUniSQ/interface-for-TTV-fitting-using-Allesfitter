@@ -164,6 +164,8 @@ def prepare_sector_frames(
             sigma_clip=sigma_clip,
             transit_mask=transit_mask,
         )
+        output["uncertainty_window_days"] = max(float(duration_hours) / 24.0, 1e-4)
+        output["final_detrend_window_days"] = max(float(flatten_duration_hours) / 24.0, 1e-4)
         prepared[key] = output.sort_values("time").reset_index(drop=True)
         summary.append({
             "sector_key": key,
@@ -176,6 +178,7 @@ def prepare_sector_frames(
             "adopted_uncertainty": float(np.nanmedian(output["flux_err"])),
             "uncertainty_window_days": max(float(duration_hours) / 24.0, 1e-4),
             "wotan_window_days": max(float(duration_hours) * 8.0 / 24.0, 1e-4),
+            "final_detrend_window_days": max(float(duration_hours) * 8.0 / 24.0, 1e-4),
             "wotan_cval": float(cval),
             "sigma_clip": float(sigma_clip),
         })
@@ -454,7 +457,10 @@ def run_target_batch(target: str, photometry_import_module, photometry_fit_modul
         ephemeris=seed,
     )
     if progress:
-        progress("uncertainties accepted or estimated; sectors detrended and flattened")
+        progress(
+            "uncertainties accepted or estimated with 1x-duration masked trend; "
+            "final sectors detrended with 8x-duration window"
+        )
     combined = pd.concat([frame.loc[~frame["is_outlier"].astype(bool)] for frame in prepared.values()], ignore_index=True).sort_values("time").reset_index(drop=True)
     reference, reference_cutout = select_reference_cutout(combined, seed)
     if progress:
