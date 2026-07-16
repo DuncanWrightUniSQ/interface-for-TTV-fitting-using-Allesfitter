@@ -1,8 +1,9 @@
-# TTV Fitter
+# Simplified TTV Fitter
 
-Version 1.0.0 Streamlit workbench for transit timing variation analysis,
-TESS photometry preparation, per-transit timing fits, and multi-planet system
-rendering.
+This branch contains the completed simplified TTV fitter: a guided Streamlit
+workflow for TESS photometry preparation, fitting one representative transit,
+measuring every suitable transit time with least-squares and MCMC, and passing
+the results into TTV modelling and system visualisation.
 
 This project provides an interface for TTV fitting using Allesfitter. It
 builds on and interoperates with Allesfitter workflows originally created by
@@ -10,17 +11,13 @@ Maximilian Guenther <maximilian.guenther@esa.int> and Tansu Daylan
 <tansu@wustl.edu>. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
 third-party attribution.
 
-The v1.0 app has five workflow tabs:
+The simplified app has four workflow tabs:
 
-- **TTV data preparation workflow**: Query/load TESS photometry, review sector
-  uncertainties, detrend high-cadence sector data, mask transits, and export
-  either stitched photometry or one prepared CSV per sector.
-- **Linear Transit Fit**: Load stitched or sector photometry, retrieve ExoFOP
-  planet/star parameters, run global linear transit fits, or fit one clean
-  transit per planet to seed later timing work.
-- **Per-Transit T0 Fit**: Build expected transit cutouts from a linear ephemeris
-  or single-transit seed, run robust multi-start least-squares midpoint fits,
-  and optionally estimate T0 uncertainties with one-parameter MCMC.
+- **TTV data preparation workflow**: Query TESS products, adopt supplied
+  uncertainties, detrend each sector, and export prepared sector tables.
+- **TTV fitting**: Load prepared sectors, retrieve ExoFOP parameters, refine one
+  clean transit, then fit all suitable transit midpoints with least-squares and
+  one-parameter MCMC timing uncertainties.
 - **TTV Model**: Edit star/planet/TTV parameters and fit a simple sinusoidal
   O-C timing model or inspect a physical REBOUND model.
 - **3D System Model**: Render a multi-planet orbital model using the fitted or
@@ -92,6 +89,7 @@ export TTV_FITTER_ALLESFITTER_PYTHON=/path/to/python-with-allesfitter
 
 This project is released under the MIT License. See [LICENSE](LICENSE).
 
-Allesfitter is also distributed under the MIT License by its original creators,
-Maximilian Guenther and Tansu Daylan; this project includes attribution in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Third-party components retain their own licences. Allesfitter and several
+direct dependencies use the MIT License, while BATMAN and REBOUND use GPLv3.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and links
+to the applicable upstream licences.

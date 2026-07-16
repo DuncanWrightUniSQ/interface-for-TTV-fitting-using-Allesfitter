@@ -74,9 +74,9 @@ def import_allesfitter_pages():
     from app.pages import photometry_fit, photometry_import, rv_import  # type: ignore
 
     patch_eleanor_flux_columns(photometry)
-    patch_mast_light_curve_filter(mast, photometry_import)
-    patch_photometry_import_sigma_control(photometry_import)
     patch_photometry_fit_exofop_resolution(mast, photometry_fit)
+    patch_mast_light_curve_filter(mast, photometry_import)
+    patch_photometry_import_sigma_control(photometry_import, photometry_fit)
     patch_photometry_loading_workflow(photometry_import, photometry_fit)
     patch_mast_product_download_button(photometry_import)
     patch_photometry_status_tables(photometry_import)
@@ -439,7 +439,7 @@ def patch_mast_light_curve_filter(mast_module, photometry_import_module) -> None
     mast_module._ttv_fitter_light_curve_patch = True
 
 
-def patch_photometry_import_sigma_control(photometry_import_module) -> None:
+def patch_photometry_import_sigma_control(photometry_import_module, photometry_fit_module=None) -> None:
     """Hide the global prep-stage outlier sigma control while keeping later review controls."""
     if getattr(photometry_import_module, "_ttv_fitter_sigma_control_patch", False):
         return
@@ -447,6 +447,9 @@ def patch_photometry_import_sigma_control(photometry_import_module) -> None:
     original_render = photometry_import_module.render
 
     def render_without_global_sigma_slider() -> None:
+        st.session_state["ttv_simplified_data_preparation"] = True
+        return _render_simplified_photometry_import(photometry_import_module, photometry_fit_module)
+
         original_slider = st.slider
         original_button = st.button
 
@@ -517,8 +520,12 @@ def _clear_photometry_preparation_state() -> None:
         "prepared_sector_photometry",
         "prepared_sector_summary",
         "prepared_sector_directory",
+        "prepared_sector_plot_directory",
         "prepared_photometry",
         "prepared_photometry_summary",
+        "ttv_simplified_preparation_complete",
+        "ttv_simplified_preparation_key",
+        "ttv_simplified_summary",
     ]:
         st.session_state.pop(key, None)
 
@@ -533,6 +540,329 @@ def _reset_photometry_preparation_workflow() -> None:
         "photometry_quality_zero_only",
     ]:
         st.session_state.pop(key, None)
+
+
+def _safe_sector_filename_part(value: object, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return cleaned or fallback
+
+
+def _prepared_sector_preview_figure(table: pd.DataFrame) -> tuple[go.Figure, str]:
+    fig = go.Figure()
+    if table is None or table.empty:
+        return fig, ""
+    stride = _simple_display_stride(len(table), max_display_points=20_000)
+    display = table.iloc[::stride].copy() if stride > 1 else table
+    if "is_outlier" in display:
+        outlier_mask = display["is_outlier"].astype(bool)
+        outlier_display = display.loc[outlier_mask]
+        kept_display = display.loc[~outlier_mask]
+    else:
+        outlier_display = pd.DataFrame()
+        kept_display = display
+    fig.add_trace(
+        go.Scattergl(
+            x=kept_display["time"],
+            y=kept_display["flux"],
+            mode="markers",
+            marker={"size": 3, "color": "#2563eb", "opacity": 0.35},
+            name="Prepared flux",
+        )
+    )
+    if not outlier_display.empty:
+        fig.add_trace(
+            go.Scattergl(
+                x=outlier_display["time"],
+                y=outlier_display["flux"],
+                mode="markers",
+                marker={"size": 6, "color": "#ef4444", "symbol": "x"},
+                name="High outliers",
+            )
+        )
+    note = _stride_note(len(table), len(display), stride) if stride > 1 else ""
+    if note:
+        fig.add_annotation(
+            text=note,
+            x=0.01,
+            y=1.06,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            align="left",
+            font={"size": 12, "color": "#64748b"},
+        )
+        fig.update_layout(meta={"ttv_sampled_plot_note": note})
+    fig.update_layout(
+        height=460,
+        margin=dict(l=95, r=35, t=45, b=65),
+        xaxis_title="Time - BTJD",
+        yaxis=dict(title="Flattened relative flux", automargin=True, title_standoff=18),
+        xaxis=dict(title="Time - BTJD", automargin=True),
+        uirevision="ttv_simplified_prepared_sector_preview",
+    )
+    return fig, note
+
+
+def _write_prepared_sector_outputs(
+    photometry_import_module,
+    sector_tables: dict[str, pd.DataFrame],
+    sector_summary: pd.DataFrame,
+    *,
+    write_plots: bool = True,
+) -> tuple[Path, Path, bytes]:
+    target_part = photometry_import_module._target_filename_part()
+    base_dir = Path("data") / "prepared" / target_part
+    sector_dir = base_dir / "sectors"
+    plot_dir = base_dir / "plots"
+    sector_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for index, (key, table) in enumerate(sector_tables.items(), start=1):
+            sector_label = str(table["sector"].iloc[0]) if "sector" in table and not table.empty else str(key)
+            clean_sector = _safe_sector_filename_part(sector_label, f"sector_{index}")
+            filename = f"{target_part}_sector_{clean_sector}.csv"
+            if "is_outlier" in table:
+                export = table.loc[~table["is_outlier"], ["time", "flux", "flux_err", "source_file", "sector"]].copy()
+            else:
+                export = table[["time", "flux", "flux_err", "source_file", "sector"]].copy()
+            local_path = sector_dir / filename
+            export.to_csv(local_path, index=False)
+            archive.writestr(f"sectors/{filename}", export.to_csv(index=False))
+
+            if write_plots:
+                trend_fig, _ = _first_pass_preview_figure(table)
+                final_fig, _ = _prepared_sector_preview_figure(table)
+                trend_html = plot_dir / f"{target_part}_sector_{clean_sector}_wotan_trend.html"
+                final_html = plot_dir / f"{target_part}_sector_{clean_sector}_flattened.html"
+                trend_fig.write_html(trend_html, include_plotlyjs="cdn")
+                final_fig.write_html(final_html, include_plotlyjs="cdn")
+                for fig, png_path in (
+                    (trend_fig, plot_dir / f"{target_part}_sector_{clean_sector}_wotan_trend.png"),
+                    (final_fig, plot_dir / f"{target_part}_sector_{clean_sector}_flattened.png"),
+                ):
+                    try:
+                        fig.write_image(png_path)
+                    except Exception:
+                        # Plotly HTML is always written; PNG export requires an optional image backend.
+                        pass
+
+        archive.writestr("sectors/sector_summary.csv", sector_summary.to_csv(index=False))
+    zip_buffer.seek(0)
+    return sector_dir, plot_dir, zip_buffer.getvalue()
+
+
+def _simplified_preparation_key(paths: list[str], window_days: float, cval: float) -> tuple:
+    return (tuple(paths), round(float(window_days), 8), round(float(cval), 8), bool(st.session_state.get("photometry_quality_zero_only", True)))
+
+
+def _render_simplified_photometry_import(photometry_import_module, photometry_fit_module=None) -> None:
+    st.info(
+        "Simplified mode queries all available TESS cadences, lets you choose products, then "
+        "automatically accepts supplied uncertainties, detrends each sector, and exports prepared sector CSVs."
+    )
+    if not st.session_state.get("target_name") and not st.session_state.get("photometry_target_input"):
+        st.session_state["target_name"] = "WASP-80"
+        st.session_state["photometry_target_input"] = "WASP-80"
+    st.session_state["mast_cadence_filter"] = "All available cadences"
+
+    st.subheader("MAST target query")
+    target = st.text_input(
+        "Target name or TIC ID",
+        key="photometry_target_input",
+        on_change=photometry_import_module._sync_photometry_target,
+    )
+    st.caption("TESS cadence is fixed to all available cadences in simplified mode.")
+    if st.button("Query MAST", use_container_width=True, type="primary", key="simplified_query_mast"):
+        query_target = str(target).strip()
+        if not query_target:
+            st.warning("Enter a target name or TIC ID first, for example `WASP-80`.")
+        else:
+            st.session_state["target_name"] = query_target
+            _clear_photometry_preparation_state()
+            with st.spinner(f"Querying MAST for {query_target}..."):
+                try:
+                    result = photometry_import_module.cached_query_tess_photometry(
+                        query_target,
+                        "All available cadences",
+                        getattr(photometry_import_module, "CACHE_VERSION", PATCHED_MAST_CACHE_VERSION),
+                    )
+                except Exception as exc:  # noqa: BLE001 - show user-facing query failures
+                    st.session_state["mast_error"] = str(exc)
+                    st.session_state.pop("mast_result", None)
+                else:
+                    st.session_state["mast_result"] = result
+                    st.session_state["mast_resolved_target"] = result.resolved_target
+                    st.session_state.pop("mast_error", None)
+
+    if st.session_state.get("mast_error"):
+        st.error(st.session_state["mast_error"])
+
+    result = st.session_state.get("mast_result")
+    if result is not None:
+        st.subheader("MAST query results")
+        photometry_import_module._display_mast_result(result)
+
+    workflow_paths = photometry_import_module._render_downloaded_files()
+    if not workflow_paths:
+        st.info("Select sector products above, then press the download button to start the automated preparation.")
+        return
+
+    st.subheader("Automated preparation")
+    quality_zero_only = True
+    st.session_state["photometry_quality_zero_only"] = True
+    sigma_clip = 5.0
+    with st.spinner("Loading sector files and checking supplied uncertainties..."):
+        sector_frames = photometry_import_module._load_sector_frames(workflow_paths, quality_zero_only)
+    if not sector_frames:
+        st.warning("No usable sector frames were loaded from the selected products.")
+        return
+
+    sector_uncertainties = st.session_state.setdefault("sector_uncertainties", {})
+    data_medians = _data_uncertainty_medians_by_sector(sector_frames, photometry_import_module.normalized_sector)
+    newly_accepted = {key: value for key, value in data_medians.items() if key not in sector_uncertainties}
+    if newly_accepted:
+        sector_uncertainties.update(newly_accepted)
+        st.session_state["sector_uncertainties"] = sector_uncertainties
+    missing_uncertainties = [key for key in sector_frames if key not in sector_uncertainties]
+    if missing_uncertainties:
+        st.warning(
+            f"{len(missing_uncertainties)} sector(s) did not include usable uncertainties. "
+            "Use the manual uncertainty workflow below, then simplified mode will continue automatically."
+        )
+        _render_uncertainty_workflow_with_bulk_accept(photometry_import_module, workflow_paths, sigma_clip, stitch=False)
+        return
+    if newly_accepted:
+        st.success(f"Accepted supplied data uncertainties for {len(newly_accepted)} sector(s).")
+    else:
+        st.success("All loaded sectors already have accepted uncertainties.")
+
+    ephemerides, message = _retrieve_exofop_ephemerides_for_flattening(photometry_fit_module)
+    if not ephemerides:
+        st.warning(message)
+        return
+    st.caption(message)
+    durations = [_coerce_float(eph.get("duration_hours"), np.nan) for eph in ephemerides]
+    finite_durations = [duration for duration in durations if np.isfinite(duration) and duration > 0]
+    if not finite_durations:
+        st.warning("ExoFOP returned planet rows, but no usable transit durations were available for automated detrending.")
+        return
+    window_days = max(0.1, 8.0 * max(finite_durations) / 24.0)
+    cval = 3.5
+    st.caption(f"Automatic heavy detrend: Wotan biweight window {window_days:.3f} days (8x longest transit duration), cval {cval:.1f}.")
+
+    prep_key = _simplified_preparation_key(workflow_paths, window_days, cval)
+    if not st.session_state.get("ttv_simplified_preparation_complete") or st.session_state.get("ttv_simplified_preparation_key") != prep_key:
+        progress = st.progress(0.0)
+        status_text = st.empty()
+        sector_flattening: dict[str, dict] = {}
+        sector_tables: dict[str, pd.DataFrame] = {}
+        summary_rows = []
+        sector_items = list(sector_frames.items())
+        total = len(sector_items)
+        with st.spinner("Automatically detrending, flattening, and writing prepared sector files..."):
+            for index, (key, frame) in enumerate(sector_items, start=1):
+                sector_label = frame["sector"].iloc[0] if not frame.empty and "sector" in frame else key
+                status_text.caption(f"Processing sector {index}/{total}: {sector_label}")
+                prepared = _flatten_sector_with_explicit_mask(
+                    photometry_import_module,
+                    frame,
+                    sector_uncertainties[key],
+                    window_length=window_days,
+                    method="biweight",
+                    transit_mask=None,
+                    cval=cval,
+                    sigma_clip=sigma_clip,
+                ).sort_values("time").reset_index(drop=True)
+                sector_tables[key] = prepared
+                high_outliers = int(prepared["is_outlier"].sum()) if "is_outlier" in prepared else 0
+                sector_flattening[key] = {
+                    "window_length": window_days,
+                    "method": "biweight",
+                    "cval": cval,
+                    "mask_transits": False,
+                    "mask_ephemerides": ephemerides,
+                    "mask_planets": len(ephemerides),
+                    "mask_width_durations": np.nan,
+                    "masked_points": 0,
+                    "found_transits": 0,
+                    "high_outliers": high_outliers,
+                }
+                summary_rows.append(
+                    {
+                        "sector_key": key,
+                        "sector": str(sector_label),
+                        "source_file": prepared["source_file"].iloc[0] if "source_file" in prepared else "",
+                        "points": len(prepared),
+                        "kept_points": int((~prepared["is_outlier"]).sum()) if "is_outlier" in prepared else len(prepared),
+                        "high_outliers": high_outliers,
+                        "adopted_uncertainty": sector_uncertainties[key],
+                        "wotan_window_days": window_days,
+                        "wotan_method": "biweight",
+                        "wotan_cval": cval,
+                    }
+                )
+                progress.progress(index / max(total, 1))
+            sector_summary = pd.DataFrame(summary_rows)
+            sector_dir, plot_dir, zip_bytes = _write_prepared_sector_outputs(
+                photometry_import_module,
+                sector_tables,
+                sector_summary,
+                write_plots=True,
+            )
+        st.session_state["sector_flattening"] = sector_flattening
+        st.session_state["prepared_sector_photometry"] = sector_tables
+        st.session_state["prepared_sector_summary"] = sector_summary
+        st.session_state["prepared_sector_directory"] = str(sector_dir)
+        st.session_state["prepared_sector_plot_directory"] = str(plot_dir)
+        st.session_state["prepared_sector_zip_bytes"] = zip_bytes
+        st.session_state["ttv_simplified_preparation_complete"] = True
+        st.session_state["ttv_simplified_preparation_key"] = prep_key
+        st.session_state["ttv_simplified_summary"] = {
+            "sectors": len(sector_tables),
+            "points": int(sum(len(table) for table in sector_tables.values())),
+            "sector_dir": str(sector_dir),
+            "plot_dir": str(plot_dir),
+        }
+        status_text.caption(f"Prepared {len(sector_tables)} sector file(s).")
+        st.success(f"Simplified data preparation complete. Sector CSVs were written to {sector_dir}; plots were written to {plot_dir}.")
+
+    summary = st.session_state.get("ttv_simplified_summary") or {}
+    if summary:
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("Prepared sectors", f"{int(summary.get('sectors', 0))}")
+        metric_cols[1].metric("Prepared points", f"{int(summary.get('points', 0)):,}")
+        metric_cols[2].metric("Plots folder", str(summary.get("plot_dir", "")))
+    if st.session_state.get("prepared_sector_zip_bytes"):
+        target_part = photometry_import_module._target_filename_part()
+        st.download_button(
+            "Download prepared sector CSV bundle",
+            data=st.session_state["prepared_sector_zip_bytes"],
+            file_name=f"{target_part}_sectors.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="simplified_download_prepared_sector_zip",
+        )
+
+    sector_tables = st.session_state.get("prepared_sector_photometry")
+    if isinstance(sector_tables, dict) and sector_tables:
+        st.subheader("Final detrended and flattened sector preview")
+        selected_key = st.selectbox(
+            "Sector to preview",
+            list(sector_tables.keys()),
+            key="simplified_prepared_sector_preview_select",
+            format_func=lambda key: str(sector_tables[key]["sector"].iloc[0]) if "sector" in sector_tables[key] and not sector_tables[key].empty else str(key),
+        )
+        figure, note = _prepared_sector_preview_figure(sector_tables[selected_key])
+        if note:
+            st.info(note)
+        st.plotly_chart(
+            figure,
+            use_container_width=True,
+            config=photometry_import_module.PLOT_CONFIG,
+            key=f"simplified_prepared_sector_preview_{selected_key}",
+        )
 
 
 def _workflow_sets_complete(stage_values: dict, sector_frames: dict[str, pd.DataFrame]) -> bool:
@@ -1247,9 +1577,9 @@ def _first_pass_preview_figure(first_pass: pd.DataFrame) -> tuple[go.Figure, str
         fig.update_layout(meta={"ttv_sampled_plot_note": note})
     fig.update_layout(
         height=460,
-        margin=dict(l=20, r=20, t=35, b=45),
-        xaxis_title="Time - BTJD",
-        yaxis_title="Relative flux",
+        margin=dict(l=95, r=35, t=45, b=65),
+        xaxis=dict(title="Time - BTJD", automargin=True),
+        yaxis=dict(title="Relative flux", automargin=True, title_standoff=18),
         uirevision="ttv_first_pass_preview",
     )
     return fig, note
@@ -3569,12 +3899,14 @@ def _render_linear_fit_data_loader(photometry_fit_module) -> None:
             sector_key = st.selectbox("Sector to plot", list(sector_tables.keys()), key="photometry_fit_sector_plot_select")
             plot_data = sector_tables[sector_key]
     plot_stride = _simple_display_stride(len(plot_data), max_display_points=20_000)
+    preview_data = plot_data
     if plot_stride > 1:
-        displayed_points = len(plot_data.iloc[::plot_stride])
+        preview_data = plot_data.iloc[::plot_stride].copy()
+        displayed_points = len(preview_data)
         st.info(f"{_stride_note(len(plot_data), displayed_points, plot_stride)} Fits still use all loaded rows.")
 
     st.plotly_chart(
-        photometry_fit_module.prepared_photometry_preview(plot_data),
+        photometry_fit_module.prepared_photometry_preview(preview_data),
         use_container_width=True,
         config=photometry_fit_module.PLOT_CONFIG,
         key="photometry_fit_loaded_data_preview",
@@ -3707,10 +4039,10 @@ def _single_transit_window_figure(
         fig.add_vrect(x0=start, x1=end, fillcolor="#ef4444", opacity=0.14, line_width=0)
     fig.update_layout(
         height=430,
-        margin=dict(l=20, r=20, t=30, b=45),
+        margin=dict(l=85, r=30, t=30, b=55),
         dragmode="select",
-        xaxis_title="Time",
-        yaxis_title="Flux",
+        xaxis=dict(title="Time", automargin=True),
+        yaxis=dict(title="Flux", automargin=True, title_standoff=18),
         uirevision="single_transit_window",
     )
     return fig
@@ -3791,6 +4123,236 @@ def _exofop_single_transit_seed(planet_name: str, data: pd.DataFrame) -> dict[st
         "baseline_offset": 0.0,
     }
     return {key: float(value) for key, value in seed.items() if np.isfinite(float(value))}
+
+
+def _linear_fit_sector_tables_for_simplified(data: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    sector_tables = st.session_state.get("photometry_fit_sector_data")
+    if isinstance(sector_tables, dict) and sector_tables:
+        cleaned: dict[str, pd.DataFrame] = {}
+        for key, table in sector_tables.items():
+            if isinstance(table, pd.DataFrame) and not table.empty:
+                cleaned[str(key)] = normalize_photometry(table).sort_values("time").reset_index(drop=True)
+        if cleaned:
+            return cleaned
+    return {"All selected data": normalize_photometry(data).sort_values("time").reset_index(drop=True)}
+
+
+def _simplified_single_transit_options(
+    tables: dict[str, pd.DataFrame],
+    seed: dict[str, float],
+    half_width_days: float,
+) -> list[dict[str, object]]:
+    period = float(seed.get("period", np.nan))
+    t0 = float(seed.get("t0", np.nan))
+    if not np.isfinite(period) or period <= 0 or not np.isfinite(t0):
+        return []
+    options: list[dict[str, object]] = []
+    seen: set[tuple[str, int]] = set()
+    for source, frame in tables.items():
+        if frame.empty or "time" not in frame:
+            continue
+        tmin = float(frame["time"].min())
+        tmax = float(frame["time"].max())
+        first_epoch = int(math.floor((tmin - half_width_days - t0) / period))
+        last_epoch = int(math.ceil((tmax + half_width_days - t0) / period))
+        for epoch in range(first_epoch, last_epoch + 1):
+            center = float(t0 + epoch * period)
+            if center + half_width_days < tmin or center - half_width_days > tmax:
+                continue
+            key = (source, epoch)
+            if key in seen:
+                continue
+            seen.add(key)
+            points = int(((frame["time"] >= center - half_width_days) & (frame["time"] <= center + half_width_days)).sum())
+            if points <= 0:
+                continue
+            label = f"Transit {epoch} | {center:.6f} BTJD | {source} | {points:,} points"
+            options.append({"label": label, "source": source, "epoch": epoch, "center": center, "points": points})
+    return sorted(options, key=lambda item: (float(item["center"]), str(item["source"])))
+
+
+def _single_transit_output_text(results: dict[str, dict[str, float]]) -> str:
+    output_lines: list[str] = []
+    for planet, fit in sorted(results.items()):
+        output_lines.append(f"[planet {planet}]")
+        for key, value in fit.items():
+            output_lines.append(f"{key}: {value}")
+        output_lines.append("")
+    return "\n".join(output_lines)
+
+
+def _single_transit_output_file_name() -> str:
+    host_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", _target_name_for_exofop_lookup() or "target").strip("_") or "target"
+    return f"{host_name}_single_transit_planet_parameters.txt"
+
+
+def _single_transit_plot_directory() -> Path:
+    prepared_dir = st.session_state.get("prepared_sector_plot_directory")
+    if prepared_dir:
+        path = Path(str(prepared_dir))
+    else:
+        host_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", _target_name_for_exofop_lookup() or "target").strip("_") or "target"
+        path = Path("data") / "prepared" / host_name / "plots"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _render_simplified_single_transit_fit_subtab() -> None:
+    st.subheader("Fit One Transit")
+    st.caption("Simplified mode uses planet b from ExoFOP, selects one predicted transit, and fits only that cutout.")
+
+    data = st.session_state.get("photometry_fit_data")
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        st.info("Load photometry data first.")
+        return
+    matches = st.session_state.get("phot_fit_exofop_matches")
+    if not isinstance(matches, pd.DataFrame) or matches.empty:
+        st.info("Search ExoFOP above first. When a match is found, planet b will be used here.")
+        return
+
+    tables = _linear_fit_sector_tables_for_simplified(data)
+    seed_data = next(iter(tables.values()))
+    seed = _exofop_single_transit_seed("b", seed_data)
+    if not seed:
+        st.warning("Could not derive planet b starting parameters from the ExoFOP match.")
+        return
+    seed_defaults = {
+        "t0": float(seed_data["time"].median()),
+        "period": 1.0,
+        "radius_ratio": 0.1,
+        "impact": 0.5,
+        "duration_hours": 3.0,
+        "a_over_rstar": 10.0,
+        "limb_darkening_u1": 0.5,
+        "limb_darkening_u2": 0.1,
+        "baseline_offset": 0.0,
+    }
+    seed_defaults.update(seed)
+    seed = seed_defaults
+
+    duration_hours = float(seed.get("duration_hours", 3.0))
+    default_half_width = max(duration_hours / 24.0 * 2.5, 0.15)
+    half_width = st.number_input(
+        "Transit cutout half-width [days]",
+        min_value=0.01,
+        max_value=10.0,
+        value=float(st.session_state.get("simplified_single_transit_half_width", default_half_width)),
+        step=0.05,
+        format="%.5f",
+        key="simplified_single_transit_half_width",
+        help="Data within +/- this time from the predicted ExoFOP transit midpoint is shown and fitted.",
+    )
+
+    transit_options = _simplified_single_transit_options(tables, seed, float(half_width))
+    if not transit_options:
+        st.warning("No predicted planet b transits fall inside the loaded photometry time range.")
+        return
+    labels = [str(option["label"]) for option in transit_options]
+    current_label = st.session_state.get("simplified_single_transit_choice")
+    index = labels.index(current_label) if current_label in labels else 0
+    selected_label = st.selectbox("Transit to fit", labels, index=index, key="simplified_single_transit_choice")
+    selected = transit_options[labels.index(selected_label)]
+    source = str(selected["source"])
+    center = float(selected["center"])
+    frame = tables[source]
+    cutout = frame.loc[(frame["time"] >= center - float(half_width)) & (frame["time"] <= center + float(half_width))].copy()
+    if cutout.empty:
+        st.info("The selected transit window contains no data.")
+        return
+
+    model_seed = seed.copy()
+    model_seed["t0"] = center
+    model_seed["planet"] = "b"
+    latest = st.session_state.get("phot_fit_single_transit_ls_result")
+    latest_matches_selection = (
+        isinstance(latest, dict)
+        and str(latest.get("planet", "b")) == "b"
+        and str(latest.get("source", "")) == source
+        and int(latest.get("epoch", -10**9)) == int(selected["epoch"])
+    )
+    if not latest_matches_selection:
+        plot_cutout, stride = _single_transit_plot_frame(cutout)
+        if stride > 1:
+            st.info(f"{_stride_note(len(cutout), len(plot_cutout), stride)} Fitting still uses every point in this cutout.")
+        st.plotly_chart(
+            _single_transit_fit_figure(cutout, model_seed),
+            width="stretch",
+            key="simplified_single_transit_default_model",
+            config={"displaylogo": False, "scrollZoom": True},
+        )
+
+    fit_parameters = [
+        "t0",
+        "radius_ratio",
+        "impact",
+        "a_over_rstar",
+        "limb_darkening_u1",
+        "limb_darkening_u2",
+        "baseline_offset",
+    ]
+    st.multiselect(
+        "Fit parameters",
+        fit_parameters,
+        default=fit_parameters,
+        key="simplified_single_transit_fit_parameters_display",
+        disabled=True,
+    )
+
+    if st.button("Refine the fit to this transit", use_container_width=True, type="primary", disabled=cutout.empty):
+        from .fitting import fit_limb_darkened_single_transit
+
+        result = fit_limb_darkened_single_transit(cutout, model_seed, fit_parameters)
+        if not result.success:
+            st.warning(f"Single-transit fit stopped before formal convergence: {result.message}")
+        fit = {
+            "planet": "b",
+            "source": source,
+            "epoch": int(selected["epoch"]),
+            "start": float(center - float(half_width)),
+            "end": float(center + float(half_width)),
+            "points": int(len(cutout)),
+            **result.params,
+        }
+        st.session_state["phot_fit_single_transit_ls_result"] = fit
+        st.session_state["phot_fit_single_transit_ls_results_by_planet"] = {"b": fit}
+        st.session_state["linear_fit_simplified_complete"] = True
+
+        output_text = _single_transit_output_text({"b": fit})
+        file_name = _single_transit_output_file_name()
+        clean_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", _target_name_for_exofop_lookup() or "target").strip("_") or "target"
+        output_path = Path("data") / "prepared" / clean_host / file_name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output_text, encoding="utf-8")
+
+        fit_fig = _single_transit_fit_figure(cutout, fit)
+        plot_path = _single_transit_plot_directory() / file_name.replace(".txt", "_fit.html")
+        fit_fig.write_html(plot_path, include_plotlyjs="cdn")
+        st.session_state["linear_fit_simplified_parameter_file"] = str(output_path)
+        st.session_state["linear_fit_simplified_plot_file"] = str(plot_path)
+        st.success("Single-transit LS fit completed and saved for the timing fits below.")
+        st.rerun()
+
+    latest = st.session_state.get("phot_fit_single_transit_ls_result")
+    if latest_matches_selection and isinstance(latest, dict) and latest:
+        fit_window = frame.loc[(frame["time"] >= float(latest["start"])) & (frame["time"] <= float(latest["end"]))].copy()
+        if not fit_window.empty:
+            st.plotly_chart(
+                _single_transit_fit_figure(fit_window, latest),
+                width="stretch",
+                key="simplified_single_transit_final_fit",
+                config={"displaylogo": False, "scrollZoom": True},
+            )
+        output_text = _single_transit_output_text({"b": latest})
+        st.download_button(
+            "Download single-transit planet parameters",
+            data=output_text.encode("utf-8"),
+            file_name=_single_transit_output_file_name(),
+            mime="text/plain",
+            use_container_width=True,
+            key="simplified_download_single_transit_planet_parameters",
+        )
+        if st.session_state.get("linear_fit_simplified_complete"):
+            st.success("This tab is complete. The single-transit planet parameters are ready for the timing fits below.")
 
 
 def _render_single_transit_fit_subtab() -> None:
@@ -3965,7 +4527,7 @@ def _render_single_transit_fit_subtab() -> None:
         all_results = st.session_state.setdefault("phot_fit_single_transit_ls_results_by_planet", {})
         all_results[str(planet_name)] = fit
         st.session_state["phot_fit_single_transit_ls_results_by_planet"] = all_results
-        st.success("Single-transit least-squares fit saved for the per-transit T0 page.")
+        st.success("Single-transit least-squares fit saved for the timing fits.")
 
     latest = st.session_state.get("phot_fit_single_transit_ls_result")
     if isinstance(latest, dict) and latest:
@@ -4039,16 +4601,13 @@ def render_import_workflows() -> None:
 
 def render_linear_transit_workflow() -> None:
     _photometry_import, _rv_import, photometry_fit = import_allesfitter_pages()
-    st.subheader("Linear Transit Fit")
+    st.subheader("TTV fitting")
+    st.session_state["linear_fit_simplified_process"] = True
     _render_linear_fit_data_loader(photometry_fit)
     st.divider()
     photometry_fit._render_exofop_retrieval()
     st.divider()
-    linear_tab, single_tab = st.tabs(["Linear fit", "Fit one transit"])
-    with linear_tab:
-        photometry_fit._render_transit_parameter_setup()
-    with single_tab:
-        _render_single_transit_fit_subtab()
+    _render_simplified_single_transit_fit_subtab()
     bridge_fit_planets()
     bridge_prepared_photometry()
 
