@@ -152,7 +152,18 @@ def prepare_sector_frames(
         uncertainty = estimate_residual_uncertainty(frame, duration_hours, cval=cval, sigma_clip=sigma_clip, transit_mask=transit_mask)
         if _finite_error(frame):
             uncertainty = float(np.nanmedian(pd.to_numeric(frame["flux_err"], errors="coerce")))
-        output = _trend_and_flatten(frame, uncertainty, duration_hours, cval=cval, sigma_clip=sigma_clip, transit_mask=transit_mask)
+        # The one-duration trend above is only for estimating missing noise.
+        # Preserve the actual transit signal with the normal simplified-mode
+        # detrend: eight transit durations.
+        flatten_duration_hours = float(duration_hours) * 8.0
+        output = _trend_and_flatten(
+            frame,
+            uncertainty,
+            flatten_duration_hours,
+            cval=cval,
+            sigma_clip=sigma_clip,
+            transit_mask=transit_mask,
+        )
         prepared[key] = output.sort_values("time").reset_index(drop=True)
         summary.append({
             "sector_key": key,
@@ -163,7 +174,8 @@ def prepare_sector_frames(
             "high_outliers": int(output["is_outlier"].sum()),
             "uncertainty_source": "data" if _finite_error(frame) else "detrended residual std",
             "adopted_uncertainty": float(np.nanmedian(output["flux_err"])),
-            "wotan_window_days": max(float(duration_hours) / 24.0, 1e-4),
+            "uncertainty_window_days": max(float(duration_hours) / 24.0, 1e-4),
+            "wotan_window_days": max(float(duration_hours) * 8.0 / 24.0, 1e-4),
             "wotan_cval": float(cval),
             "sigma_clip": float(sigma_clip),
         })
