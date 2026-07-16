@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 import math
 import re
+import shutil
 from typing import Callable
 
 import matplotlib.pyplot as plt
@@ -168,6 +169,31 @@ def _align_t0(t0: float, photometry: pd.DataFrame) -> float:
     if median > 2400000 and t0 < 100000:
         return t0 + 2457000.0
     return t0
+
+
+def normalize_time_to_btjd(frame: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """Normalize common JD/BJD time columns to the TESS BTJD scale."""
+    out = frame.copy()
+    values = pd.to_numeric(out.get("time", pd.Series(dtype=float)), errors="coerce")
+    finite = values[np.isfinite(values)]
+    if finite.empty:
+        return out, "unchanged"
+    median = float(finite.median())
+    if median > 2_400_000:
+        out["time"] = values - 2_457_000.0
+        return out, "BJD/JD → BTJD"
+    return out, "BTJD"
+
+
+def anchor_epoch_to_data(t0: float, period: float, photometry: pd.DataFrame) -> float:
+    """Fold a reference epoch by integer periods so it lies near the data."""
+    times = pd.to_numeric(photometry.get("time", pd.Series(dtype=float)), errors="coerce")
+    finite = times[np.isfinite(times)]
+    if finite.empty or not np.isfinite(t0) or not np.isfinite(period) or period <= 0:
+        return float(t0)
+    midpoint = float(finite.median())
+    cycles = int(np.round((midpoint - float(t0)) / float(period)))
+    return float(t0 + cycles * period)
 
 
 def planet_b_seed(matches: pd.DataFrame, photometry: pd.DataFrame) -> dict[str, float]:
@@ -346,6 +372,8 @@ def save_target_outputs(target: str, prepared: dict[str, pd.DataFrame], summary:
         reference_t0 = float(seed["t0"]) - int(reference["epoch"]) * float(seed["period"])
         oc_figure(timings, reference_t0, float(seed["period"])).write_html(plots / f"{safe_target_slug(target)}_b_OC_MCMC.html", include_plotlyjs="cdn")
         (plots / f"{safe_target_slug(target)}_b_OC_MCMC.png").write_bytes(_oc_png_bytes(timings, reference_t0, float(seed["period"])))
+        shutil.copy2(plots / f"{safe_target_slug(target)}_b_OC_MCMC.html", results / f"{safe_target_slug(target)}_b_OC_MCMC.html")
+        shutil.copy2(plots / f"{safe_target_slug(target)}_b_OC_MCMC.png", results / f"{safe_target_slug(target)}_b_OC_MCMC.png")
         timings.to_csv(results / f"{safe_target_slug(target)}_b_mcmc_timings.csv", index=False)
         oc_table(timings, reference_t0, float(seed["period"])).to_csv(results / f"{safe_target_slug(target)}_b_oc_table.csv", index=False)
     return plots, results
@@ -353,6 +381,11 @@ def save_target_outputs(target: str, prepared: dict[str, pd.DataFrame], summary:
 
 def run_target_batch(target: str, photometry_import_module, photometry_fit_module, progress: Progress = None) -> dict[str, object]:
     """Download, prepare, fit, and save one target."""
+    output_base = Path("data") / "prepared" / safe_target_slug(target)
+    if output_base.exists():
+        shutil.rmtree(output_base)
+    if progress:
+        progress("starting; previous prepared outputs will be replaced")
     result: MastQueryResult = photometry_import_module.cached_query_tess_photometry(
         target,
         "All available cadences",
@@ -377,7 +410,8 @@ def run_target_batch(target: str, photometry_import_module, photometry_fit_modul
         except Exception:
             continue
         if not frame.empty:
-            frames[f"S{frame['sector'].iloc[0]} | {path.name}"] = frame
+            normalized, _scale = normalize_time_to_btjd(frame)
+            frames[f"S{normalized['sector'].iloc[0]} | {path.name}"] = normalized
     if not frames:
         raise ValueError("Downloaded products contained no readable photometry tables.")
     if progress:
@@ -389,6 +423,7 @@ def run_target_batch(target: str, photometry_import_module, photometry_fit_modul
     matches = photometry_fit_module.find_toi_parameters(toi_table, tic)
     combined_raw = pd.concat(frames.values(), ignore_index=True).sort_values("time").reset_index(drop=True)
     seed = planet_b_seed(matches, combined_raw)
+    seed["t0"] = anchor_epoch_to_data(seed["t0"], seed["period"], combined_raw)
     if progress:
         progress(f"ExoFOP planet b parameters loaded for TIC {tic}")
     prepared, summary = prepare_sector_frames(frames, seed["duration_hours"], cval=3.5, sigma_clip=4.0)

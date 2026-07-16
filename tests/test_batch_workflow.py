@@ -8,7 +8,9 @@ import numpy as np
 import pandas as pd
 
 from ttv_fitter.batch_workflow import (
+    anchor_epoch_to_data,
     filter_product_filenames,
+    normalize_time_to_btjd,
     parse_target_list,
     planet_b_seed,
     select_reference_cutout,
@@ -50,6 +52,16 @@ class BatchWorkflowTests(unittest.TestCase):
         reference, cutout = select_reference_cutout(photometry, seed)
         self.assertEqual(reference["epoch"], 1)
         self.assertEqual(reference["points"], len(cutout))
+
+    def test_epoch_is_folded_into_observed_data_span(self) -> None:
+        photometry = pd.DataFrame({"time": [2539.0, 2541.0]})
+        self.assertAlmostEqual(anchor_epoch_to_data(3262.6699, 2.6557, photometry), 2540.3195, places=3)
+
+    def test_jd_times_are_converted_to_btjd(self) -> None:
+        frame = pd.DataFrame({"time": [2459540.0, 2459541.0], "flux": [1.0, 1.0]})
+        converted, scale = normalize_time_to_btjd(frame)
+        self.assertEqual(scale, "BJD/JD → BTJD")
+        self.assertTrue(np.allclose(converted["time"], [2540.0, 2541.0]))
 
 
 if __name__ == "__main__":

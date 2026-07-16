@@ -207,13 +207,18 @@ def batch_workflow_tab() -> None:
         st.session_state["batch_results"] = []
         overall = st.progress(0.0)
         for index, target in enumerate(targets, start=1):
-            status = st.status(f"{index}/{len(targets)} — {target}", expanded=False)
+            status = st.status(f"{index}/{len(targets)} — {target}: starting", expanded=True)
+
+            def report_step(message: str, *, status=status, index=index, target=target) -> None:
+                status.write(message)
+                status.update(label=f"{index}/{len(targets)} — {target}: {message}", state="running")
+
             try:
                 result = run_target_batch(
                     target,
                     photometry_import,
                     photometry_fit,
-                    progress=lambda message, status=status: status.write(message),
+                    progress=report_step,
                 )
             except Exception as exc:  # noqa: BLE001 - keep batch processing moving per target
                 result = {"target": target, "status": "error", "error": str(exc)}
