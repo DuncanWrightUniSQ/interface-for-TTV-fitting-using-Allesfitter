@@ -175,7 +175,7 @@ def batch_workflow_tab() -> None:
         "Upload one target per line. Each target is queried at all available TESS cadences, "
         "prepared, fitted, and saved before the next target starts."
     )
-    _photometry_import, _rv_import, photometry_fit = import_allesfitter_pages()
+    photometry_import, _rv_import, photometry_fit = import_allesfitter_pages()
     uploaded = st.file_uploader(
         "Upload target list",
         type=["txt", "list"],
