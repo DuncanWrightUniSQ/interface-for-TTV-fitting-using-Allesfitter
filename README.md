@@ -1,6 +1,6 @@
-# Simplified TTV Fitter
+# Automatic multi-target TTV fitter
 
-This branch extends the completed simplified TTV fitter into a single automatic
+This version extends the completed simplified TTV fitter into a single automatic
 multi-target workflow. Upload one target per line and the app queries MAST,
 prepares each target, retrieves planet b parameters, fits a representative
 transit, measures every suitable transit time with least-squares and MCMC, and
