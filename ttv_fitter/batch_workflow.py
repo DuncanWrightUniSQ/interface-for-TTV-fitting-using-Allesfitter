@@ -434,7 +434,11 @@ def run_target_batch(target: str, photometry_import_module, photometry_fit_modul
     if progress:
         progress(f"selected reference transit {int(reference['epoch'])} ({int(reference['points'])} points)")
     fit_params = ["t0", "radius_ratio", "impact", "a_over_rstar", "limb_darkening_u1", "limb_darkening_u2", "baseline_offset"]
-    fit = fit_limb_darkened_single_transit(reference_cutout, seed, fit_params)
+    # Match the simplified UI: initialize the one-transit refinement at the
+    # selected cutout's predicted midpoint, rather than at the global epoch
+    # anchor (which may be several periods away from this particular cutout).
+    reference_seed = {**seed, "t0": float(reference["expected_tmid"])}
+    fit = fit_limb_darkened_single_transit(reference_cutout, reference_seed, fit_params)
     if not fit.success:
         raise ValueError(f"Reference transit fit did not converge: {fit.message}")
     fitted_seed = {**seed, **fit.params}
