@@ -20,6 +20,7 @@ from ttv_fitter.alles_workflows import (
     _available_wotan_method,
     _clean_exofop_planet_label,
     _duration_hours_from_exofop_row,
+    _transit_mask_for_ephemerides,
     _wotan_trend_with_method,
 )
 from ttv_fitter.fitting import (
@@ -71,6 +72,7 @@ def estimate_residual_uncertainty(
     *,
     cval: float = 3.5,
     sigma_clip: float = 4.0,
+    transit_mask: np.ndarray | None = None,
 ) -> float:
     """Estimate one sector uncertainty from detrended residual scatter."""
     normalized = normalized_sector(frame)
@@ -80,6 +82,7 @@ def estimate_residual_uncertainty(
         frame,
         window_days,
         _available_wotan_method("biweight")[0],
+        mask=transit_mask,
         cval=float(cval),
     )
     residual = normalized["flux"].to_numpy(dtype=float) - np.asarray(trend, dtype=float)
@@ -101,11 +104,12 @@ def _trend_and_flatten(
     *,
     cval: float = 3.5,
     sigma_clip: float = 4.0,
+    transit_mask: np.ndarray | None = None,
 ) -> pd.DataFrame:
     normalized = normalized_sector(frame)
     window_days = max(float(duration_hours) / 24.0, 1e-4)
     adapter = type("PhotometryAdapter", (), {"normalized_sector": staticmethod(normalized_sector)})()
-    trend = _wotan_trend_with_method(adapter, frame, window_days, "biweight", cval=float(cval))
+    trend = _wotan_trend_with_method(adapter, frame, window_days, "biweight", mask=transit_mask, cval=float(cval))
     trend = np.asarray(trend, dtype=float)
     safe_trend = np.where(np.isfinite(trend) & (trend != 0), trend, np.nan)
     prepared = normalized.copy()
@@ -137,14 +141,18 @@ def prepare_sector_frames(
     *,
     cval: float = 3.5,
     sigma_clip: float = 4.0,
+    ephemeris: dict[str, float] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
     prepared: dict[str, pd.DataFrame] = {}
     summary: list[dict[str, object]] = []
     for key, frame in frames.items():
-        uncertainty = estimate_residual_uncertainty(frame, duration_hours, cval=cval, sigma_clip=sigma_clip)
+        transit_mask = None
+        if ephemeris:
+            transit_mask = _transit_mask_for_ephemerides(frame, [ephemeris], width_durations=2.0)
+        uncertainty = estimate_residual_uncertainty(frame, duration_hours, cval=cval, sigma_clip=sigma_clip, transit_mask=transit_mask)
         if _finite_error(frame):
             uncertainty = float(np.nanmedian(pd.to_numeric(frame["flux_err"], errors="coerce")))
-        output = _trend_and_flatten(frame, uncertainty, duration_hours, cval=cval, sigma_clip=sigma_clip)
+        output = _trend_and_flatten(frame, uncertainty, duration_hours, cval=cval, sigma_clip=sigma_clip, transit_mask=transit_mask)
         prepared[key] = output.sort_values("time").reset_index(drop=True)
         summary.append({
             "sector_key": key,
@@ -426,7 +434,13 @@ def run_target_batch(target: str, photometry_import_module, photometry_fit_modul
     seed["t0"] = anchor_epoch_to_data(seed["t0"], seed["period"], combined_raw)
     if progress:
         progress(f"ExoFOP planet b parameters loaded for TIC {tic}")
-    prepared, summary = prepare_sector_frames(frames, seed["duration_hours"], cval=3.5, sigma_clip=4.0)
+    prepared, summary = prepare_sector_frames(
+        frames,
+        seed["duration_hours"],
+        cval=3.5,
+        sigma_clip=4.0,
+        ephemeris=seed,
+    )
     if progress:
         progress("uncertainties accepted or estimated; sectors detrended and flattened")
     combined = pd.concat([frame.loc[~frame["is_outlier"].astype(bool)] for frame in prepared.values()], ignore_index=True).sort_values("time").reset_index(drop=True)
