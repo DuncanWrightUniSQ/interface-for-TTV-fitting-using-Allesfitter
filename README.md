@@ -1,9 +1,10 @@
 # Simplified TTV Fitter
 
-This branch contains the completed simplified TTV fitter: a guided Streamlit
-workflow for TESS photometry preparation, fitting one representative transit,
-measuring every suitable transit time with least-squares and MCMC, and passing
-the results into TTV modelling and system visualisation.
+This branch extends the completed simplified TTV fitter into a single automatic
+multi-target workflow. Upload one target per line and the app queries MAST,
+prepares each target, retrieves planet b parameters, fits a representative
+transit, measures every suitable transit time with least-squares and MCMC, and
+saves the plots and results before moving to the next target.
 
 This project provides an interface for TTV fitting using Allesfitter. It
 builds on and interoperates with Allesfitter workflows originally created by
@@ -11,17 +12,21 @@ Maximilian Guenther <maximilian.guenther@esa.int> and Tansu Daylan
 <tansu@wustl.edu>. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
 third-party attribution.
 
-The simplified app has four workflow tabs:
+The batch app has one visible workflow:
 
-- **TTV data preparation workflow**: Query TESS products, adopt supplied
-  uncertainties, detrend each sector, and export prepared sector tables.
-- **TTV fitting**: Load prepared sectors, retrieve ExoFOP parameters, refine one
-  clean transit, then fit all suitable transit midpoints with least-squares and
-  one-parameter MCMC timing uncertainties.
-- **TTV Model**: Edit star/planet/TTV parameters and fit a simple sinusoidal
-  O-C timing model or inspect a physical REBOUND model.
-- **3D System Model**: Render a multi-planet orbital model using the fitted or
-  edited parameters.
+- **Automatic multi-target TTV workflow**: Upload a UTF-8 text file containing
+  one target name or TIC ID per line. All available TESS cadences are queried;
+  joined Diamante products are excluded, while other readable products are
+  downloaded and prepared. Data uncertainties are accepted when supplied, or
+  estimated from one-duration Wōtan residuals with cval 3.5 and 4-sigma
+  clipping. Planet b parameters are retrieved from ExoFOP, the first transit
+  within 10% of the maximum cutout point count is refined automatically, and
+  all suitable transit timing MCMCs are run automatically. Each target gets
+  its own `data/prepared/<target>/plots` and `results` directories.
+
+The earlier single-target fitting, TTV model, and 3D system capabilities remain
+available in the source code for later development, but are hidden from this
+batch app entry point.
 
 Generated target data, downloaded MAST files, and prepared sector products are
 written under `data/` and are intentionally ignored by git.

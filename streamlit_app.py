@@ -20,7 +20,9 @@ from ttv_fitter.alles_workflows import (
     _sector_tables_from_directory,
     render_import_workflows,
     render_linear_transit_workflow,
+    import_allesfitter_pages,
 )
+from ttv_fitter.batch_workflow import parse_target_list, run_target_batch
 from ttv_fitter.fitting import (
     build_cutouts,
     fit_cutout_t0,
@@ -164,6 +166,70 @@ def planet_editor(prefix: str = "planet") -> pd.DataFrame:
 def linear_fit_tab() -> None:
     render_linear_transit_workflow()
     _render_streamlined_ttv_timing_section()
+
+
+def batch_workflow_tab() -> None:
+    """Visible entry point for the automatic multi-target simplified workflow."""
+    st.subheader("Automatic multi-target TTV workflow")
+    st.caption(
+        "Upload one target per line. Each target is queried at all available TESS cadences, "
+        "prepared, fitted, and saved before the next target starts."
+    )
+    _photometry_import, _rv_import, photometry_fit = import_allesfitter_pages()
+    uploaded = st.file_uploader(
+        "Upload target list",
+        type=["txt", "list"],
+        accept_multiple_files=False,
+        key="batch_target_list_upload",
+        help="One target name or TIC ID per line. Blank lines and lines beginning with # are ignored.",
+    )
+    if uploaded is not None:
+        try:
+            text = uploaded.getvalue().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            st.error("The target list must be a UTF-8 text file.")
+            return
+        targets = parse_target_list(text)
+        st.session_state["batch_target_list_text"] = text
+        st.session_state["batch_targets"] = targets
+        if targets:
+            st.success(f"Loaded {len(targets)} target(s) from {uploaded.name}.")
+        else:
+            st.warning("The uploaded target list contains no usable target lines.")
+
+    targets = st.session_state.get("batch_targets", [])
+    if not targets:
+        st.info("Upload a UTF-8 text file containing one star name or TIC ID per line to begin.")
+        return
+    st.caption("Diamante joined products are excluded automatically; all other MAST products are downloaded and used when readable.")
+    if st.button("Run automatic workflow for all targets", type="primary", use_container_width=True, key="run_batch_workflow"):
+        summaries: list[dict[str, object]] = []
+        st.session_state["batch_results"] = []
+        overall = st.progress(0.0)
+        for index, target in enumerate(targets, start=1):
+            status = st.status(f"{index}/{len(targets)} — {target}", expanded=False)
+            try:
+                result = run_target_batch(
+                    target,
+                    photometry_import,
+                    photometry_fit,
+                    progress=lambda message, status=status: status.write(message),
+                )
+            except Exception as exc:  # noqa: BLE001 - keep batch processing moving per target
+                result = {"target": target, "status": "error", "error": str(exc)}
+                status.update(label=f"{index}/{len(targets)} — {target}: failed", state="error")
+            else:
+                result["status"] = "complete"
+                status.update(label=f"{index}/{len(targets)} — {target}: complete", state="complete")
+            summaries.append(result)
+            st.session_state["batch_results"] = summaries.copy()
+            overall.progress(index / len(targets))
+        st.success(f"Automatic workflow finished for {len(targets)} target(s).")
+
+    results = st.session_state.get("batch_results", [])
+    if results:
+        st.subheader("Workflow summary")
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
 
 def _fit_param_labels(params: pd.DataFrame | None) -> list[str]:
@@ -1897,24 +1963,8 @@ def model_3d_tab() -> None:
 
 def main() -> None:
     init_state()
-    st.title("TTV Fitter")
-    st.caption("Transit timing variation fitting, transit-shape fitting, and 3D multiplanet rendering.")
-    tabs = st.tabs(
-        [
-            "TTV data preparation workflow",
-            "TTV fitting",
-            "TTV Model",
-            "3D System Model",
-        ]
-    )
-    with tabs[0]:
-        data_import_tab()
-    with tabs[1]:
-        linear_fit_tab()
-    with tabs[2]:
-        ttv_model_tab()
-    with tabs[3]:
-        model_3d_tab()
+    st.title("Simplified TTV Fitter")
+    batch_workflow_tab()
 
 
 if __name__ == "__main__":
