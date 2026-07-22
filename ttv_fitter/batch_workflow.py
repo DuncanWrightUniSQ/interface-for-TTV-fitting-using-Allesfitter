@@ -53,9 +53,12 @@ def parse_target_list(text: str) -> list[str]:
 
 def filter_product_filenames(products: pd.DataFrame) -> list[str]:
     """Return every product except joined Diamante light curves."""
-    if not isinstance(products, pd.DataFrame) or products.empty or "productFilename" not in products:
+    if not isinstance(products, pd.DataFrame) or products.empty:
         return []
-    names = products["productFilename"].dropna().astype(str)
+    filename_column = next((column for column in ("productFilename", "product_filename", "filename") if column in products), None)
+    if filename_column is None:
+        return []
+    names = products[filename_column].dropna().astype(str)
     return sorted({name for name in names if "diamante" not in name.lower()})
 
 
@@ -425,6 +428,13 @@ def run_target_batch(target: str, photometry_import_module, photometry_fit_modul
         int(getattr(photometry_import_module, "CACHE_VERSION", 1)),
     )
     product_names = filter_product_filenames(result.products)
+    if not product_names and hasattr(photometry_import_module, "query_tess_photometry"):
+        if progress:
+            progress("MAST cache returned no products; retrying the live product query")
+        live_result = photometry_import_module.query_tess_photometry(target, "All available cadences")
+        if live_result.products is not None and not live_result.products.empty:
+            result = live_result
+            product_names = filter_product_filenames(result.products)
     if not product_names:
         raise ValueError("MAST returned no usable non-Diamante products.")
     if progress:

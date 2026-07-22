@@ -25,6 +25,10 @@ class BatchWorkflowTests(unittest.TestCase):
         products = pd.DataFrame({"productFilename": ["a.fits", "hlsp_diamante_tess_lightcurve.fits", "A.fits", None]})
         self.assertEqual(filter_product_filenames(products), ["A.fits", "a.fits"])
 
+    def test_product_filter_accepts_alternate_filename_column(self) -> None:
+        products = pd.DataFrame({"filename": ["sector_lc.fits", "diamante_lc.fits"]})
+        self.assertEqual(filter_product_filenames(products), ["sector_lc.fits"])
+
     def test_planet_b_seed_aligns_bjd_to_btjd_data(self) -> None:
         matches = pd.DataFrame(
             [
