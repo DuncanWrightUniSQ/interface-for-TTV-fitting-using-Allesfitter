@@ -1,8 +1,10 @@
-# TTV Fitter
+# Automatic multi-target TTV fitter — v1.0.0
 
-Version 1.0.0 Streamlit workbench for transit timing variation analysis,
-TESS photometry preparation, per-transit timing fits, and multi-planet system
-rendering.
+This version extends the completed simplified TTV fitter into a single automatic
+multi-target workflow. Upload one target per line and the app queries MAST,
+prepares each target, retrieves planet b parameters, fits a representative
+transit, measures every suitable transit time with least-squares and MCMC, and
+saves the plots and results before moving to the next target.
 
 This project provides an interface for TTV fitting using Allesfitter. It
 builds on and interoperates with Allesfitter workflows originally created by
@@ -10,21 +12,21 @@ Maximilian Guenther <maximilian.guenther@esa.int> and Tansu Daylan
 <tansu@wustl.edu>. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
 third-party attribution.
 
-The v1.0 app has five workflow tabs:
+The batch app has one visible workflow:
 
-- **TTV data preparation workflow**: Query/load TESS photometry, review sector
-  uncertainties, detrend high-cadence sector data, mask transits, and export
-  either stitched photometry or one prepared CSV per sector.
-- **Linear Transit Fit**: Load stitched or sector photometry, retrieve ExoFOP
-  planet/star parameters, run global linear transit fits, or fit one clean
-  transit per planet to seed later timing work.
-- **Per-Transit T0 Fit**: Build expected transit cutouts from a linear ephemeris
-  or single-transit seed, run robust multi-start least-squares midpoint fits,
-  and optionally estimate T0 uncertainties with one-parameter MCMC.
-- **TTV Model**: Edit star/planet/TTV parameters and fit a simple sinusoidal
-  O-C timing model or inspect a physical REBOUND model.
-- **3D System Model**: Render a multi-planet orbital model using the fitted or
-  edited parameters.
+- **Automatic multi-target TTV workflow**: Upload a UTF-8 text file containing
+  one target name or TIC ID per line. All available TESS cadences are queried;
+  joined Diamante products are excluded, while other readable products are
+  downloaded and prepared. Data uncertainties are accepted when supplied, or
+  estimated from one-duration Wōtan residuals with cval 3.5 and 4-sigma
+  clipping. Planet b parameters are retrieved from ExoFOP, the first transit
+  within 10% of the maximum cutout point count is refined automatically, and
+  all suitable transit timing MCMCs are run automatically. Each target gets
+  its own `data/prepared/<target>/plots` and `results` directories.
+
+The earlier single-target fitting, TTV model, and 3D system capabilities remain
+available in the source code for later development, but are hidden from this
+batch app entry point.
 
 Generated target data, downloaded MAST files, and prepared sector products are
 written under `data/` and are intentionally ignored by git.
@@ -46,6 +48,25 @@ source .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
+
+### Install the automatic multi-target version
+
+To install this exact published version, clone the version tag rather than the
+moving default branch:
+
+```bash
+git clone --branch v1.0.0-automatic-multi-target-ttv-fitter --depth 1 \
+  https://github.com/DuncanWrightUniSQ/interface-for-TTV-fitting-using-Allesfitter.git
+cd interface-for-TTV-fitting-using-Allesfitter
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+The app will be available at `http://localhost:8501`. Upload a UTF-8 target
+list with one star name or TIC ID per line, then run the automatic workflow.
 
 On Windows PowerShell, activate the environment with:
 
@@ -92,6 +113,7 @@ export TTV_FITTER_ALLESFITTER_PYTHON=/path/to/python-with-allesfitter
 
 This project is released under the MIT License. See [LICENSE](LICENSE).
 
-Allesfitter is also distributed under the MIT License by its original creators,
-Maximilian Guenther and Tansu Daylan; this project includes attribution in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Third-party components retain their own licences. Allesfitter and several
+direct dependencies use the MIT License, while BATMAN and REBOUND use GPLv3.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and links
+to the applicable upstream licences.

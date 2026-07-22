@@ -20,7 +20,9 @@ from ttv_fitter.alles_workflows import (
     _sector_tables_from_directory,
     render_import_workflows,
     render_linear_transit_workflow,
+    import_allesfitter_pages,
 )
+from ttv_fitter.batch_workflow import parse_target_list, run_target_batch
 from ttv_fitter.fitting import (
     build_cutouts,
     fit_cutout_t0,
@@ -54,7 +56,7 @@ from ttv_fitter.plots import (
     t0_histogram_figure,
 )
 from ttv_fitter.plots import physical_oc_figure, physical_rv_figure, physical_transit_figure, rebound_3d_figure
-from ttv_fitter.ttv import allesfitter_ttv_rows, fit_linear_ephemeris, fit_sinusoidal_ttv
+from ttv_fitter.ttv import allesfitter_ttv_rows, fit_linear_ephemeris, fit_sinusoidal_ttv, oc_table
 
 
 st.set_page_config(page_title="TTV Fitter", page_icon="TTV", layout="wide")
@@ -163,6 +165,84 @@ def planet_editor(prefix: str = "planet") -> pd.DataFrame:
 
 def linear_fit_tab() -> None:
     render_linear_transit_workflow()
+    _render_streamlined_ttv_timing_section()
+
+
+def batch_workflow_tab() -> None:
+    """Visible entry point for the automatic multi-target simplified workflow."""
+    st.subheader("Automatic multi-target TTV workflow")
+    st.caption(
+        "Upload one target per line. Each target is queried at all available TESS cadences, "
+        "prepared, fitted, and saved before the next target starts."
+    )
+    photometry_import, _rv_import, photometry_fit = import_allesfitter_pages()
+    uploaded = st.file_uploader(
+        "Upload target list",
+        # Do not rely on the browser's extension/MIME filter: macOS and synced
+        # folders can report ordinary .txt files with a non-text MIME type.
+        type=None,
+        accept_multiple_files=False,
+        key="batch_target_list_upload",
+        help="One target name or TIC ID per line. Blank lines and lines beginning with # are ignored.",
+    )
+    if uploaded is not None:
+        raw = uploaded.getvalue()
+        text = None
+        for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            st.error("Could not decode the target list as plain text (UTF-8, UTF-16, or Windows-1252).")
+            return
+        targets = parse_target_list(text)
+        st.session_state["batch_target_list_text"] = text
+        st.session_state["batch_targets"] = targets
+        if targets:
+            st.success(f"Loaded {len(targets)} target(s) from {uploaded.name}.")
+        else:
+            st.warning("The uploaded target list contains no usable target lines.")
+
+    targets = st.session_state.get("batch_targets", [])
+    if not targets:
+        st.info("Upload a UTF-8 text file containing one star name or TIC ID per line to begin.")
+        return
+    st.caption("Diamante joined products are excluded automatically; all other MAST products are downloaded and used when readable.")
+    if st.button("Run automatic workflow for all targets", type="primary", use_container_width=True, key="run_batch_workflow"):
+        summaries: list[dict[str, object]] = []
+        st.session_state["batch_results"] = []
+        overall = st.progress(0.0)
+        for index, target in enumerate(targets, start=1):
+            status = st.status(f"{index}/{len(targets)} — {target}: starting", expanded=True)
+
+            def report_step(message: str, *, status=status, index=index, target=target) -> None:
+                status.write(message)
+                status.update(label=f"{index}/{len(targets)} — {target}: {message}", state="running")
+
+            try:
+                result = run_target_batch(
+                    target,
+                    photometry_import,
+                    photometry_fit,
+                    progress=report_step,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep batch processing moving per target
+                result = {"target": target, "status": "error", "error": str(exc)}
+                status.update(label=f"{index}/{len(targets)} — {target}: failed", state="error")
+            else:
+                result["status"] = "complete"
+                status.update(label=f"{index}/{len(targets)} — {target}: complete", state="complete")
+            summaries.append(result)
+            st.session_state["batch_results"] = summaries.copy()
+            overall.progress(index / len(targets))
+        st.success(f"Automatic workflow finished for {len(targets)} target(s).")
+
+    results = st.session_state.get("batch_results", [])
+    if results:
+        st.subheader("Workflow summary")
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
 
 def _fit_param_labels(params: pd.DataFrame | None) -> list[str]:
@@ -215,14 +295,14 @@ def _linear_fit_parameter_set(planet_name: str, source_kind: str) -> tuple[dict[
             "limb_darkening_u2": fit.get("limb_darkening_u2", np.nan),
             "baseline_offset": fit.get("baseline_offset", 0.0),
         }
-        return selected, "latest single-transit least-squares fit from the Linear Transit Fit page"
+        return selected, "latest single-transit least-squares fit from the TTV fitting tab"
 
     params = st.session_state.get("phot_fit_generated_params")
     fit_dir = st.session_state.get("phot_fit_directory", "")
     param_table = params if isinstance(params, pd.DataFrame) else None
     labels = _fit_param_labels(param_table)
     values = _float_param_values(param_table)
-    source = "current generated Linear Transit Fit parameter table"
+    source = "current generated TTV fitting parameter table"
 
     if source_kind == "mcmc":
         backend_path = Path(fit_dir) / "results" / "mcmc_save.h5" if fit_dir else None
@@ -237,7 +317,7 @@ def _linear_fit_parameter_set(planet_name: str, source_kind: str) -> tuple[dict[
             if samples.size and samples.shape[1] == len(labels):
                 medians = np.nanmedian(samples, axis=0)
                 values.update({label: float(value) for label, value in zip(labels, medians)})
-                source = "posterior median from the latest Linear Transit Fit MCMC chain"
+                source = "posterior median from the latest TTV fitting MCMC chain"
             else:
                 return {}, ""
         except Exception:
@@ -713,17 +793,18 @@ def _render_cutout_mcmc_results(planet_name: str, t0: float, period: float) -> N
         return
 
     st.subheader("Per-transit T0 MCMC results")
+    fit_photometry = st.session_state.get("cutout_mcmc_photometry", st.session_state.photometry)
     details = details.sort_values("epoch")
     options = details["epoch"].astype(int).tolist()
     selected_epoch = st.selectbox(
         "Inspect MCMC transit fit",
         options,
-        format_func=lambda epoch: f"Epoch {int(epoch)}",
+        format_func=lambda epoch: f"Transit {int(epoch)}",
         key=f"cutout_mcmc_fit_select_{planet_name}",
     )
     selected = details.loc[details["epoch"].astype(int) == int(selected_epoch)].iloc[0].to_dict()
     st.plotly_chart(
-        cutout_fit_figure(st.session_state.photometry, selected),
+        cutout_fit_figure(fit_photometry, selected),
         use_container_width=True,
         config=PLOT_CONFIG,
         key=f"cutout_mcmc_fit_plot_{planet_name}_{int(selected_epoch)}",
@@ -731,7 +812,7 @@ def _render_cutout_mcmc_results(planet_name: str, t0: float, period: float) -> N
     fit_filename = f"{_target_label()}_{_safe_filename_part(planet_name)}_Tr{int(selected_epoch)}.png"
     st.download_button(
         "Download selected MCMC fit PNG",
-        _fit_png_bytes(st.session_state.photometry, selected),
+        _fit_png_bytes(fit_photometry, selected),
         fit_filename,
         "image/png",
         use_container_width=True,
@@ -839,7 +920,6 @@ def _fit_png_bytes(phot: pd.DataFrame, fit: dict[str, float]) -> bytes:
 
 def _oc_png_bytes(timings: pd.DataFrame, t0: float, period: float) -> bytes:
     import matplotlib.pyplot as plt
-    from ttv_fitter.ttv import oc_table
 
     table = oc_table(timings, t0, period)
     fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
@@ -854,6 +934,398 @@ def _oc_png_bytes(timings: pd.DataFrame, t0: float, period: float) -> bytes:
     fig.savefig(buffer, format="png")
     plt.close(fig)
     return buffer.getvalue()
+
+
+def _t0_histogram_png_bytes(samples: pd.DataFrame, tmid: float, err_minus: float, err_plus: float) -> bytes:
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=160)
+    if isinstance(samples, pd.DataFrame) and "tmid" in samples.columns and not samples.empty:
+        ax.hist(samples["tmid"].to_numpy(dtype=float), bins=40, color="#2563eb", alpha=0.72)
+    ax.axvline(tmid, color="#dc2626", lw=2.4, label="median")
+    ax.axvspan(tmid - err_minus, tmid + err_plus, color="#dc2626", alpha=0.14)
+    ax.set_xlabel("T0")
+    ax.set_ylabel("Samples")
+    ax.set_title("T0 posterior")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png")
+    plt.close(fig)
+    return buffer.getvalue()
+
+
+def _finite_float(value: object, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return float(parsed) if np.isfinite(parsed) else float(default)
+
+
+def _ensure_ttv_timing_photometry() -> bool:
+    # The timing section belongs to the fit workflow above it.  Always prefer
+    # that workflow's explicit data source over the generic bridge photometry,
+    # which may still contain a different target from an earlier app run.
+    for key, source in [
+        ("photometry_fit_sector_data", "TTV fitting sector data"),
+    ]:
+        tables = st.session_state.get(key)
+        if isinstance(tables, dict) and tables and _load_cutout_sector_tables(tables, source):
+            return True
+
+    for key, source in [
+        ("photometry_fit_data", "TTV fitting photometry"),
+    ]:
+        data = st.session_state.get(key)
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            if "is_outlier" in data:
+                data = data.loc[~data["is_outlier"].astype(bool)].copy()
+            st.session_state.photometry = normalize_photometry(data)
+            st.session_state["cutout_photometry_source"] = source
+            return True
+
+    for key, source in [
+        ("prepared_sector_photometry", "TTV data preparation sector data"),
+    ]:
+        tables = st.session_state.get(key)
+        if isinstance(tables, dict) and tables and _load_cutout_sector_tables(tables, source):
+            return True
+
+    for key, source in [
+        ("prepared_photometry", "prepared stitched photometry"),
+    ]:
+        data = st.session_state.get(key)
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            if "is_outlier" in data:
+                data = data.loc[~data["is_outlier"].astype(bool)].copy()
+            st.session_state.photometry = normalize_photometry(data)
+            st.session_state["cutout_photometry_source"] = source
+            return True
+
+    photometry = st.session_state.get("photometry", pd.DataFrame())
+    if isinstance(photometry, pd.DataFrame) and not photometry.empty and {"time", "flux"}.issubset(photometry.columns):
+        st.session_state.photometry = normalize_photometry(photometry)
+        st.session_state.setdefault("cutout_photometry_source", "previously loaded photometry")
+        return True
+
+    return False
+
+
+def _streamlined_timing_parameters() -> tuple[str, dict[str, float], str]:
+    planets = coerce_planet_table(st.session_state.get("planets"))
+    names = planets["name"].astype(str).tolist() if not planets.empty else ["b"]
+    planet_name = "b" if "b" in names else names[0]
+    values, source = _linear_fit_parameter_set(planet_name, "single_ls")
+    if not values and not planets.empty:
+        row = planets.loc[planets["name"].astype(str) == str(planet_name)].iloc[0]
+        values = _planet_row_cutout_values(row)
+        source = "current planet table"
+
+    defaults = {
+        "t0": 0.0,
+        "period": 3.0,
+        "radius_ratio": 0.08,
+        "impact": 0.4,
+        "a_over_rstar": 8.0,
+        "duration_hours": 3.0,
+        "limb_darkening_u1": 0.5,
+        "limb_darkening_u2": 0.1,
+        "baseline_offset": 0.0,
+    }
+    clean = {key: _finite_float(values.get(key), default) for key, default in defaults.items()}
+    clean["period"] = max(clean["period"], 1e-8)
+    clean["duration_hours"] = max(clean["duration_hours"], 1e-4)
+    clean["radius_ratio"] = float(np.clip(clean["radius_ratio"], 1e-6, 1.0))
+    clean["impact"] = float(np.clip(clean["impact"], 0.0, 2.0))
+    clean["a_over_rstar"] = max(clean["a_over_rstar"], 1e-6)
+    clean["t0"] = _align_t0_to_photometry_time(clean["t0"], st.session_state.get("photometry", pd.DataFrame()))
+    # A single-transit fit stores the transit number shown in the selector.
+    # Convert its fitted midpoint back to the same epoch-zero reference so the
+    # timing stage does not silently rename that transit as epoch zero.
+    epoch_offset = 0
+    single_fit = st.session_state.get("phot_fit_single_transit_ls_result")
+    if isinstance(single_fit, dict) and str(single_fit.get("planet", planet_name)) == str(planet_name):
+        try:
+            epoch_offset = int(single_fit.get("epoch", 0))
+        except (TypeError, ValueError):
+            epoch_offset = 0
+    clean["reference_epoch"] = float(epoch_offset)
+    clean["t0"] = float(clean["t0"] - epoch_offset * clean["period"])
+    return planet_name, clean, source
+
+
+def _timing_photometry_signature(photometry: pd.DataFrame, source: str) -> tuple[object, ...]:
+    if not isinstance(photometry, pd.DataFrame) or photometry.empty or "time" not in photometry:
+        return (str(source), 0, np.nan, np.nan)
+    time = pd.to_numeric(photometry["time"], errors="coerce")
+    sectors = tuple(sorted(photometry["sector"].dropna().astype(str).unique())) if "sector" in photometry else ()
+    files = tuple(sorted(photometry["source_file"].dropna().astype(str).unique())) if "source_file" in photometry else ()
+    return (str(source), int(len(photometry)), float(time.min()), float(time.max()), sectors, files)
+
+
+def _clear_stale_timing_results() -> None:
+    for key in [
+        "timings",
+        "cutout_fit_details",
+        "cutout_mcmc_timings",
+        "cutout_mcmc_fit_details",
+        "cutout_mcmc_samples",
+        "cutout_mcmc_photometry",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _ttv_timing_output_dirs() -> tuple[Path, Path]:
+    target = _target_label()
+    base = Path("data") / "prepared" / target
+    plots_dir = Path(st.session_state.get("prepared_sector_plot_directory") or (base / "plots"))
+    results_dir = base / "results"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    return plots_dir, results_dir
+
+
+def _write_plotly_html(fig, path: Path) -> None:
+    fig.update_layout(margin=dict(l=90, r=150, t=55, b=75))
+    fig.write_html(path, include_plotlyjs="cdn")
+
+
+def _save_streamlined_ttv_outputs(planet_name: str, t0: float, period: float) -> None:
+    details = st.session_state.get("cutout_mcmc_fit_details", pd.DataFrame())
+    timings = st.session_state.get("cutout_mcmc_timings", pd.DataFrame())
+    samples_by_epoch = st.session_state.get("cutout_mcmc_samples", {})
+    if not isinstance(details, pd.DataFrame) or details.empty or not isinstance(timings, pd.DataFrame) or timings.empty:
+        return
+
+    current_details = details.loc[details["planet"].astype(str) == str(planet_name)].copy()
+    current_timings = timings.loc[timings["planet"].astype(str) == str(planet_name)].copy()
+    if current_details.empty or current_timings.empty:
+        return
+
+    fit_photometry = st.session_state.get("cutout_mcmc_photometry", st.session_state.photometry)
+    plots_dir, results_dir = _ttv_timing_output_dirs()
+    target = _target_label()
+    planet_part = _safe_filename_part(planet_name)
+    saved = 0
+    for detail in current_details.to_dict("records"):
+        epoch = int(detail["epoch"])
+        stem = f"{target}_{planet_part}_Tr{epoch}"
+        fit_fig = cutout_fit_figure(fit_photometry, detail)
+        _write_plotly_html(fit_fig, plots_dir / f"{stem}_mcmc_fit.html")
+        (plots_dir / f"{stem}_mcmc_fit.png").write_bytes(_fit_png_bytes(fit_photometry, detail))
+
+        samples = samples_by_epoch.get(epoch, pd.DataFrame())
+        if not isinstance(samples, pd.DataFrame):
+            samples = pd.DataFrame(samples)
+        hist_fig = t0_histogram_figure(
+            samples,
+            float(detail["tmid"]),
+            float(detail["tmid_err_minus"]),
+            float(detail["tmid_err_plus"]),
+        )
+        _write_plotly_html(hist_fig, plots_dir / f"{stem}_t0_distribution.html")
+        (plots_dir / f"{stem}_t0_distribution.png").write_bytes(
+            _t0_histogram_png_bytes(
+                samples,
+                float(detail["tmid"]),
+                float(detail["tmid_err_minus"]),
+                float(detail["tmid_err_plus"]),
+            )
+        )
+        saved += 3
+
+    oc_fig = oc_figure(current_timings, t0, period)
+    for directory in [plots_dir, results_dir]:
+        _write_plotly_html(oc_fig, directory / f"{target}_{planet_part}_OC_MCMC.html")
+        (directory / f"{target}_{planet_part}_OC_MCMC.png").write_bytes(_oc_png_bytes(current_timings, t0, period))
+
+    oc_data = oc_table(current_timings, t0, period)
+    oc_data.to_csv(results_dir / f"{target}_{planet_part}_oc_table.csv", index=False)
+    current_timings.to_csv(results_dir / f"{target}_{planet_part}_mcmc_timings.csv", index=False)
+    st.session_state["streamlined_ttv_plots_dir"] = str(plots_dir)
+    st.session_state["streamlined_ttv_results_dir"] = str(results_dir)
+    st.session_state["streamlined_ttv_saved_plot_count"] = saved + 2
+
+
+def _render_streamlined_ttv_timing_section() -> None:
+    st.divider()
+    st.subheader("Transit timing fits")
+    st.caption("Fit every suitable transit cutout, then estimate T0 uncertainties with a one-parameter MCMC for each transit.")
+
+    if not _ensure_ttv_timing_photometry():
+        st.info("Complete the single-transit fit and import sector data above before running timing fits.")
+        return
+
+    timing_source = str(st.session_state.get("cutout_photometry_source", "TTV fitting photometry"))
+    timing_signature = _timing_photometry_signature(st.session_state.photometry, timing_source)
+    previous_signature = st.session_state.get("streamlined_ttv_data_signature")
+    has_unbound_results = (
+        previous_signature is None
+        and isinstance(st.session_state.get("cutout_mcmc_fit_details"), pd.DataFrame)
+        and not st.session_state.get("cutout_mcmc_fit_details", pd.DataFrame()).empty
+        and not isinstance(st.session_state.get("cutout_mcmc_photometry"), pd.DataFrame)
+    )
+    if has_unbound_results or (previous_signature is not None and previous_signature != timing_signature):
+        _clear_stale_timing_results()
+    st.session_state["streamlined_ttv_data_signature"] = timing_signature
+
+    planet_name, params, source = _streamlined_timing_parameters()
+    if params["t0"] == 0.0 or params["period"] <= 0:
+        st.info("Complete the single-transit fit above so the timing fitter has a T0, period, and transit shape.")
+        return
+
+    duration_days = max(params["duration_hours"] / 24.0, 1e-4)
+    default_cutout = max(4.0 * duration_days, 0.125)
+    default_search = min(default_cutout * 0.8, max(duration_days, 0.05))
+    st.session_state.setdefault("streamlined_cutout_half_width", float(default_cutout))
+    st.session_state.setdefault("streamlined_t0_search_half_width", float(default_search))
+
+    c1, c2 = st.columns(2)
+    half_width = c1.number_input(
+        "Cutout half-width [days]",
+        min_value=0.001,
+        format="%.5f",
+        key="streamlined_cutout_half_width",
+        help="Half-width of each transit cutout around the predicted linear ephemeris midpoint.",
+    )
+    search_half_width = c2.number_input(
+        "T0 search half-width [days]",
+        min_value=1e-5,
+        format="%.5f",
+        key="streamlined_t0_search_half_width",
+        help="Allowed midpoint shift for LS and MCMC timing fits. MCMC ranges are centred on the LS midpoint for each transit.",
+    )
+
+    cutouts = build_cutouts(st.session_state.photometry, params["t0"], params["period"], half_width)
+    suitable = cutouts.loc[cutouts["points"].astype(int) >= 20].copy() if not cutouts.empty else pd.DataFrame()
+    st.caption(
+        f"Using planet {planet_name} parameters from {source or 'the current fit state'}. "
+        f"Photometry source: {timing_source} ({len(st.session_state.photometry):,} points; "
+        f"BTJD {st.session_state.photometry['time'].min():.3f} to {st.session_state.photometry['time'].max():.3f}). "
+        f"{len(suitable)} of {len(cutouts)} predicted cutout(s) have enough points to fit."
+    )
+    if suitable.empty:
+        st.info("No suitable transit cutouts were found for the current ephemeris and cutout width.")
+        return
+
+    if st.button("Fit cutout midpoints and run T0 MCMC", use_container_width=True, type="primary"):
+        phot = st.session_state.photometry
+        results: list[dict[str, object]] = []
+        fit_details: list[dict[str, object]] = []
+        ls_progress = st.progress(0.0)
+        ls_status = st.empty()
+        for index, item in enumerate(suitable.to_dict("records"), start=1):
+            ls_status.info(f"Least-squares fitting transit {index}/{len(suitable)} (epoch {int(item['epoch'])})...")
+            mask = (phot["time"] >= item["start"]) & (phot["time"] <= item["end"])
+            result = fit_cutout_t0(
+                phot.loc[mask],
+                params["period"],
+                float(item["expected_tmid"]),
+                params["radius_ratio"],
+                params["impact"],
+                params["a_over_rstar"],
+                params["duration_hours"],
+                params["limb_darkening_u1"],
+                params["limb_darkening_u2"],
+                params["baseline_offset"],
+                search_half_width,
+                use_t0_multistart=True,
+            )
+            if result.success:
+                row = {
+                    "planet": planet_name,
+                    "epoch": int(item["epoch"]),
+                    "tmid": result.params["tmid"],
+                    "expected_tmid": item["expected_tmid"],
+                    "points": int(item["points"]),
+                }
+                results.append(row)
+                fit_details.append(
+                    {
+                        **row,
+                        "start": float(item["start"]),
+                        "end": float(item["end"]),
+                        "period": params["period"],
+                        "radius_ratio": params["radius_ratio"],
+                        "impact": params["impact"],
+                        "a_over_rstar": params["a_over_rstar"],
+                        "duration_hours": params["duration_hours"],
+                        "limb_darkening_u1": params["limb_darkening_u1"],
+                        "limb_darkening_u2": params["limb_darkening_u2"],
+                        "baseline_offset": params["baseline_offset"],
+                    }
+                )
+            ls_progress.progress(index / len(suitable))
+
+        if not fit_details:
+            ls_status.warning("No cutout midpoint fits converged.")
+            return
+
+        st.session_state.timings = pd.DataFrame(results)
+        st.session_state.cutout_fit_details = pd.DataFrame(fit_details)
+        ls_status.success(f"Least-squares midpoint fits completed for {len(fit_details)} transit(s).")
+
+        mcmc_rows: list[dict[str, object]] = []
+        mcmc_details: list[dict[str, object]] = []
+        samples_by_epoch: dict[int, pd.DataFrame] = {}
+        mcmc_progress = st.progress(0.0)
+        mcmc_status = st.empty()
+        for index, fit in enumerate(fit_details, start=1):
+            epoch = int(fit["epoch"])
+            mcmc_status.info(f"MCMC fitting transit {index}/{len(fit_details)} (epoch {epoch})...")
+            mask = (phot["time"] >= fit["start"]) & (phot["time"] <= fit["end"])
+            result = run_cutout_t0_mcmc(
+                phot.loc[mask],
+                float(fit["period"]),
+                float(fit["tmid"]),
+                float(fit["radius_ratio"]),
+                float(fit["impact"]),
+                float(fit["a_over_rstar"]),
+                float(fit["duration_hours"]),
+                float(fit["limb_darkening_u1"]),
+                float(fit["limb_darkening_u2"]),
+                float(fit["baseline_offset"]),
+                search_half_width_days=float(search_half_width),
+                nwalkers=6,
+                nsteps=1000,
+                burn=500,
+                trim_nonconverged_walkers=True,
+            )
+            if result.success:
+                row = {
+                    "planet": planet_name,
+                    "epoch": epoch,
+                    "tmid": result.params["tmid"],
+                    "tmid_err": result.params["tmid_err"],
+                    "tmid_err_minus": result.params["tmid_err_minus"],
+                    "tmid_err_plus": result.params["tmid_err_plus"],
+                    "expected_tmid": fit["expected_tmid"],
+                    "points": int(fit["points"]),
+                    "nwalkers_used": result.params.get("nwalkers_used", np.nan),
+                    "nwalkers_trimmed": result.params.get("nwalkers_trimmed", np.nan),
+                }
+                detail = dict(fit)
+                detail.update(result.params)
+                mcmc_rows.append(row)
+                mcmc_details.append(detail)
+                samples_by_epoch[epoch] = result.samples
+            mcmc_progress.progress(index / len(fit_details))
+
+        if not mcmc_rows:
+            mcmc_status.warning("No MCMC timing fits converged.")
+            return
+
+        st.session_state.cutout_mcmc_timings = pd.DataFrame(mcmc_rows)
+        st.session_state.cutout_mcmc_fit_details = pd.DataFrame(mcmc_details)
+        st.session_state.cutout_mcmc_samples = samples_by_epoch
+        st.session_state.cutout_mcmc_photometry = phot.copy()
+        _save_streamlined_ttv_outputs(planet_name, params["t0"], params["period"])
+        plots_dir = st.session_state.get("streamlined_ttv_plots_dir")
+        results_dir = st.session_state.get("streamlined_ttv_results_dir")
+        mcmc_status.success(f"MCMC timing fits completed. Saved plots to {plots_dir} and results to {results_dir}.")
+
+    _render_cutout_mcmc_results(planet_name, params["t0"], params["period"])
 
 
 def per_transit_tab() -> None:
@@ -1230,13 +1702,13 @@ def ttv_model_tab() -> None:
     st.subheader("TTV Interface")
     st.caption("Measure per-transit timings, inspect phenomenological O-C curves, or run a physical REBOUND model.")
     if st.button(
-        "Retrieve star-planet parameters from the LS fit in the Linear Transit Fit tab",
+        "Retrieve star-planet parameters from the LS fit in the TTV fitting tab",
         use_container_width=True,
-        help="Copies the latest least-squares star values and derived planet geometry from the Linear Transit Fit tab into this TTV model setup.",
+        help="Copies the latest least-squares star values and derived planet geometry from the TTV fitting tab into this TTV model setup.",
     ):
         retrieved_planets, retrieved_mass, retrieved_radius = _linear_fit_planet_table_from_ls()
         if retrieved_planets.empty:
-            st.warning("No Linear Transit Fit LS parameter table is available yet.")
+            st.warning("No TTV fitting LS parameter table is available yet.")
         else:
             st.session_state.ttv_host_mass = retrieved_mass
             st.session_state.ttv_host_radius = retrieved_radius
@@ -1504,27 +1976,8 @@ def model_3d_tab() -> None:
 
 def main() -> None:
     init_state()
-    st.title("TTV Fitter")
-    st.caption("Transit timing variation fitting, linear transit/RV fits, and 3D multiplanet rendering.")
-    tabs = st.tabs(
-        [
-            "TTV data preparation workflow",
-            "Linear Transit Fit",
-            "Per-Transit T0 Fit",
-            "TTV Model",
-            "3D System Model",
-        ]
-    )
-    with tabs[0]:
-        data_import_tab()
-    with tabs[1]:
-        linear_fit_tab()
-    with tabs[2]:
-        per_transit_tab()
-    with tabs[3]:
-        ttv_model_tab()
-    with tabs[4]:
-        model_3d_tab()
+    st.title("Simplified TTV Fitter")
+    batch_workflow_tab()
 
 
 if __name__ == "__main__":

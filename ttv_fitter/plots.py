@@ -115,9 +115,12 @@ def oc_figure(timings: pd.DataFrame, t0: float, period: float, model_table: pd.D
         )
     fig.update_layout(
         height=420,
-        margin=dict(l=20, r=20, t=30, b=45),
+        # Leave room for the rotated O-C label and tick values in exported
+        # standalone HTML figures (which do not get Streamlit's auto-margin).
+        margin=dict(l=90, r=25, t=30, b=55),
         xaxis_title="Transit epoch",
         yaxis_title="O-C [minutes]",
+        yaxis=dict(automargin=True, title_standoff=14),
     )
     return fig
 

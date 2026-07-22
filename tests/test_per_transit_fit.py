@@ -620,6 +620,66 @@ class PerTransitFitTests(unittest.TestCase):
         self.assertEqual(st.session_state["cutout_photometry_source"], "test sectors")
         self.assertEqual(st.session_state.photometry["time"].tolist(), [1.0, 3.0])
 
+    def test_streamlined_timing_prefers_current_fit_sectors_over_stale_bridge_data(self) -> None:
+        import streamlit as st
+        import streamlit_app
+
+        st.session_state["photometry"] = pd.DataFrame(
+            {"time": [2771.0], "flux": [1.0], "flux_err": [0.001], "sector": ["old"]}
+        )
+        st.session_state["photometry_fit_sector_data"] = {
+            "45": pd.DataFrame(
+                {
+                    "time": [2526.5, 2526.6],
+                    "flux": [1.0, 0.99],
+                    "flux_err": [0.001, 0.001],
+                    "sector": [45, 45],
+                }
+            ),
+            "72": pd.DataFrame(
+                {
+                    "time": [3262.2],
+                    "flux": [1.0],
+                    "flux_err": [0.001],
+                    "sector": [72],
+                }
+            ),
+        }
+
+        self.assertTrue(streamlit_app._ensure_ttv_timing_photometry())
+        self.assertEqual(st.session_state["cutout_photometry_source"], "TTV fitting sector data")
+        self.assertEqual(st.session_state.photometry["time"].tolist(), [2526.5, 2526.6, 3262.2])
+
+    def test_streamlined_timing_keeps_single_transit_number_as_epoch_reference(self) -> None:
+        import streamlit as st
+        import streamlit_app
+
+        st.session_state["photometry"] = pd.DataFrame(
+            {"time": [2537.0, 2540.0], "flux": [1.0, 1.0], "flux_err": [0.001, 0.001]}
+        )
+        st.session_state["planets"] = coerce_planet_table(pd.DataFrame([{"name": "b"}]))
+        fit = {
+            "planet": "b",
+            "epoch": 1,
+            "t0": 2540.326192,
+            "period": 2.655676,
+            "radius_ratio": 0.14,
+            "impact": 0.5,
+            "a_over_rstar": 8.0,
+            "duration_hours": 2.6,
+            "limb_darkening_u1": 0.5,
+            "limb_darkening_u2": 0.1,
+            "baseline_offset": 0.0,
+        }
+        st.session_state["phot_fit_single_transit_ls_result"] = fit
+        st.session_state["phot_fit_single_transit_ls_results_by_planet"] = {"b": fit}
+
+        planet, params, _source = streamlit_app._streamlined_timing_parameters()
+
+        self.assertEqual(planet, "b")
+        self.assertEqual(params["reference_epoch"], 1.0)
+        self.assertAlmostEqual(params["t0"] + params["period"], fit["t0"])
+
     def test_planet_row_cutout_values_include_timing_and_shape(self) -> None:
         import streamlit_app
 
