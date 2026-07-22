@@ -1,4 +1,4 @@
-# Automatic multi-target TTV fitter
+# Automatic multi-target TTV fitter — v1.0.0
 
 This version extends the completed simplified TTV fitter into a single automatic
 multi-target workflow. Upload one target per line and the app queries MAST,
@@ -48,6 +48,25 @@ source .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
+
+### Install the automatic multi-target version
+
+To install this exact published version, clone the version tag rather than the
+moving default branch:
+
+```bash
+git clone --branch v1.0.0-automatic-multi-target-ttv-fitter --depth 1 \
+  https://github.com/DuncanWrightUniSQ/interface-for-TTV-fitting-using-Allesfitter.git
+cd interface-for-TTV-fitting-using-Allesfitter
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+The app will be available at `http://localhost:8501`. Upload a UTF-8 target
+list with one star name or TIC ID per line, then run the automatic workflow.
 
 On Windows PowerShell, activate the environment with:
 
